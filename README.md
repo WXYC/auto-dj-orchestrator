@@ -59,7 +59,7 @@ Key sections for the orchestrator:
 
 - **Runtime**: Node.js / TypeScript
 - **AzuraCast client**: `centrifuge-js` (Centrifugo WebSocket) + `fetch` (HTTP polling fallback)
-- **Auth**: Better Auth PAT for Backend-Service API; `X-Auto-DJ-Key` for tubafrenzy; JWT/JWKS validation (via `jose`) for admin endpoints
+- **Auth**: Better Auth JWT (service account, refresh on startup) for Backend-Service API; `X-Auto-DJ-Key` for tubafrenzy; JWT/JWKS validation (via `jose`) for admin endpoints
 - **Deployment**: Railway (`main` -> staging, `prod` -> production)
 - **Types**: `@wxyc/shared/auto-dj` for shared type contracts
 
