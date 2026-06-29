@@ -53,12 +53,18 @@ All env vars are documented in `.env.example` and validated by `src/config.ts` a
 
 ## Testing
 
-TDD, pure modules first. `npm test` runs the unit suites (reducer, conflict/breakpoint, parse, map-track, token-manager incl. the refresh-race case, jwks-verifier) and the coordinator integration test (fakes for the flowsheet client, AzuraCast source, Arduino sink, and state store). The drivable AzuraCast mock + fake-Arduino-WS end-to-end integration lands with the management channel (PR B).
+TDD, pure modules first. `npm test` runs the unit suites (reducer, conflict/breakpoint, parse, map-track, token-manager incl. the refresh-race case, jwks-verifier, codec, device-status, command-queue) plus integration: the coordinator with fakes; a real `ws` "Arduino" client driving the real WS server + orchestrator into a mocked Backend-Service (button → join → ack(`result.active`); relay live-DJ → end); and a real `AzuraCastSubscriber` polling a drivable now-playing server through to a flowsheet entry.
+
+## Management channel (`src/management/`)
+
+The Arduino-facing channel. `ws-server.ts` hosts a WebSocket at `/api/auto-dj/ws` (auth: `X-Auto-DJ-Key` validated on the upgrade, timing-safe), routing inbound frames: heartbeat → device status + relay-derived `RELAY_STATE`; `button_toggle` → toggle + ack with `result.active`; `ack` → resolve the pending command; `error` → log. `arduino-http.ts` is the WiFi HTTP fallback (`POST /heartbeat`, `GET /commands`, `POST /commands/ack`); button presses ride `button_press_count` and toggle when odd. `codec.ts` zod-validates frames; `device-status.ts` projects the status `device` block; `command-queue.ts` is the shared pending-command queue. WS ping/pong keepalive terminates a socket that misses a pong.
+
+`test/mocks/azuracast-mock/` is a dependency-free, drivable now-playing server (control endpoints `POST /__control/track` and `/__control/live`) used by the staging environment. The orchestrator ships as a multi-stage `Dockerfile`.
 
 ## Status
 
-- **PR A (this):** core service — config, AzuraCast subscriber, BS client + token manager, activation reducer + conflict/breakpoint, virtual-switch API, healthcheck. The Arduino command sink and device status are stubbed via `src/ports.ts`.
-- **PR B (next):** management channel (WS server at `/api/auto-dj/ws` + HTTP fallback), device status, command queue, Dockerfile, AzuraCast mock, end-to-end integration tests.
+- **PR A:** core service — config, AzuraCast subscriber, BS client + token manager, activation reducer + conflict/breakpoint, virtual-switch API, healthcheck.
+- **PR B:** management channel (WS server + HTTP fallback), device status, command queue, codec, Dockerfile, drivable AzuraCast mock, end-to-end integration.
 
 ## Shared types
 

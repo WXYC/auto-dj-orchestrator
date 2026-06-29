@@ -1,7 +1,7 @@
 /**
- * Ports the coordinator depends on but that are implemented elsewhere (or in a
- * later PR). Keeping them as interfaces lets PR A wire the core + virtual-switch
- * API against simple stubs, while PR B supplies the real management channel.
+ * Ports the coordinator depends on, decoupling it from the management channel.
+ * `CommandQueue` implements `ArduinoCommandSink` and `DeviceStatusStore`
+ * implements `DeviceStatusProvider` (src/management/).
  */
 import type { AutoDJCommandAction, AutoDJDeviceSummary } from './contracts.js';
 
@@ -14,9 +14,3 @@ export interface ArduinoCommandSink {
 export interface DeviceStatusProvider {
   summary(): AutoDJDeviceSummary | null;
 }
-
-/** No-op command sink used until the management channel (PR B) is wired. */
-export const noopArduinoSink: ArduinoCommandSink = { send: () => {} };
-
-/** Device provider that reports "never connected" until PR B replaces it. */
-export const noDeviceProvider: DeviceStatusProvider = { summary: () => null };

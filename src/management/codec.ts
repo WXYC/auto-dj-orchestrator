@@ -1,0 +1,94 @@
+/**
+ * Pure parse/serialize for the Arduino management channel. Inbound frames are
+ * zod-validated against the AutoDJ message union (networking-spec §3.6.2);
+ * malformed/unknown frames parse to null and are dropped.
+ */
+import { z } from 'zod';
+import type { AutoDJCommand, AutoDJWebSocketMessage } from '../contracts.js';
+
+const stateEnum = z.enum(['BOOTING', 'CONNECTING', 'CONNECTED', 'ERROR_STATE']);
+
+const heartbeat = z.object({
+  type: z.literal('heartbeat'),
+  state: stateEnum,
+  transport: z.enum(['ethernet', 'wifi']),
+  uptime_s: z.number(),
+  wifi_rssi: z.number().nullish(),
+  free_ram: z.number(),
+  radio_show_id: z.number().nullish(),
+  last_track: z.object({ artist: z.string(), title: z.string(), posted_at: z.number() }).optional(),
+  last_error: z.string().nullish(),
+  firmware_version: z.string(),
+  config_hash: z.string(),
+  loop_max_ms: z.number(),
+  reconnect_count: z.number(),
+  tracks_detected: z.number(),
+  tracks_posted: z.number(),
+  errors_since_boot: z.number(),
+  button_press_count: z.number().optional(),
+  relay_auto_dj_active: z.boolean().optional(),
+});
+
+const ack = z.object({
+  type: z.literal('ack'),
+  id: z.string(),
+  status: z.enum(['ok', 'error', 'unknown_command']),
+  error: z.string().optional(),
+  result: z.record(z.unknown()).optional(),
+});
+
+const buttonToggle = z.object({
+  type: z.literal('button_toggle'),
+  timestamp: z.number(),
+});
+
+const errorReport = z.object({
+  type: z.literal('error'),
+  level: z.enum(['warning', 'error', 'fatal']),
+  module: z.string(),
+  code: z.string(),
+  message: z.string(),
+  state: stateEnum,
+  uptime_s: z.number(),
+  free_ram: z.number(),
+  count: z.number(),
+});
+
+const nowPlaying = z.object({
+  type: z.literal('now_playing'),
+  sh_id: z.number(),
+  artist: z.string(),
+  title: z.string(),
+  album: z.string(),
+  is_live: z.boolean(),
+});
+
+/** Messages the Arduino sends to the orchestrator. */
+const inbound = z.discriminatedUnion('type', [
+  heartbeat,
+  ack,
+  buttonToggle,
+  errorReport,
+  nowPlaying,
+]);
+
+export type InboundMessage = z.infer<typeof inbound>;
+
+/** Validate an already-parsed value (HTTP bodies arrive pre-parsed by express.json). */
+export function validateInbound(value: unknown): InboundMessage | null {
+  const result = inbound.safeParse(value);
+  return result.success ? result.data : null;
+}
+
+/** Parse a raw frame (WS), returning null if it is not a valid inbound message. */
+export function parseInbound(raw: string): InboundMessage | null {
+  try {
+    return validateInbound(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function serialize(message: AutoDJWebSocketMessage | AutoDJCommand): string {
+  return JSON.stringify(message);
+}

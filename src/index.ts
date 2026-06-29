@@ -14,7 +14,9 @@ import { createLogger } from './logger.js';
 import { createJwtVerifier, remoteJwks } from './http/jwks-verifier.js';
 import { createApp } from './http/server.js';
 import { StateStore } from './persistence/state-store.js';
-import { noDeviceProvider, noopArduinoSink } from './ports.js';
+import { CommandQueue } from './management/command-queue.js';
+import { DeviceStatusStore } from './management/device-status.js';
+import { ManagementWsServer } from './management/ws-server.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -38,6 +40,8 @@ async function main(): Promise<void> {
   });
 
   const stateStore = new StateStore(config.STATE_STORE_PATH, logger);
+  const commandQueue = new CommandQueue();
+  const deviceStore = new DeviceStatusStore(config.DEVICE_OFFLINE_THRESHOLD_MS);
 
   // The subscriber's callbacks reference the orchestrator, which references the
   // subscriber — break the cycle with a forward declaration. Callbacks only
@@ -61,8 +65,8 @@ async function main(): Promise<void> {
   orchestrator = new Orchestrator({
     flowsheet,
     azuracast,
-    arduino: noopArduinoSink, // PR B replaces with the management channel
-    device: noDeviceProvider, // PR B replaces with live device status
+    arduino: commandQueue,
+    device: deviceStore,
     stateStore,
     logger,
   });
@@ -73,8 +77,23 @@ async function main(): Promise<void> {
     keyInput: remoteJwks(config.BETTER_AUTH_JWKS_URL),
   });
 
-  const app = createApp({ orchestrator, verifier, corsAllowedOrigins: config.corsAllowedOrigins });
+  const app = createApp({
+    orchestrator,
+    verifier,
+    corsAllowedOrigins: config.corsAllowedOrigins,
+    arduino: { authKey: config.AUTO_DJ_KEY, deviceStore, commandQueue, logger },
+  });
   const server = createServer(app);
+
+  const wsServer = new ManagementWsServer({
+    authKey: config.AUTO_DJ_KEY,
+    orchestrator,
+    deviceStore,
+    commandQueue,
+    pingIntervalMs: config.WS_PING_INTERVAL_MS,
+    logger,
+  });
+  wsServer.attach(server);
 
   // Recover from a persisted snapshot first (based on Backend-Service state),
   // THEN start the continuous subscriber. If recovery re-attached a show but a
@@ -92,6 +111,7 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     logger.info({ signal }, 'shutting down (show is left running for recovery)');
     orchestrator.stop();
+    wsServer.close();
     server.close(() => process.exit(0));
     // Hard cap so a stuck connection can't hang shutdown.
     setTimeout(() => process.exit(0), 5000).unref();
