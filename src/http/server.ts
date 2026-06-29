@@ -7,11 +7,14 @@ import express, { type Express, type RequestHandler } from 'express';
 import type { Orchestrator } from '../core/orchestrator.js';
 import type { JwtVerifier } from './jwks-verifier.js';
 import { virtualSwitchRouter } from './routes/virtual-switch.js';
+import { arduinoHttpRouter, type ArduinoHttpDeps } from './routes/arduino-http.js';
 
 export interface ServerDeps {
   orchestrator: Orchestrator;
   verifier: JwtVerifier;
   corsAllowedOrigins: string[];
+  /** Arduino HTTP fallback (management channel). */
+  arduino: Omit<ArduinoHttpDeps, 'orchestrator'>;
 }
 
 /** Minimal CORS for the dj-site browser origin(s). */
@@ -46,6 +49,9 @@ export function createApp(deps: ServerDeps): Express {
     '/api/auto-dj',
     virtualSwitchRouter({ orchestrator: deps.orchestrator, verifier: deps.verifier }),
   );
+
+  // Arduino HTTP fallback (WiFi): heartbeat, command poll, ack.
+  app.use('/api/auto-dj', arduinoHttpRouter({ ...deps.arduino, orchestrator: deps.orchestrator }));
 
   return app;
 }
