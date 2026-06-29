@@ -1,0 +1,65 @@
+# auto-dj-orchestrator
+
+Node/TypeScript service that bridges WXYC's auto-DJ (AzuraCast) with the station flowsheet. It is the **single brain** of the auto-DJ system: it owns activation state, conflict resolution, the AzuraCast subscription, all flowsheet writes, hourly breakpoints, the dj-site virtual switch API, and the Arduino management channel.
+
+## Architecture
+
+The orchestrator writes **only to Backend-Service**. BS mirrors every flowsheet write to legacy tubafrenzy automatically, so there is no direct-tubafrenzy path and no dual-backend flag. It authenticates as the **Auto-DJ service account** (a `dj`-role Better-Auth user) and creates the show AS that account (BS enforces `dj_id === req.auth.id`).
+
+The Arduino is a "dumb" relay/button reporter; it does not talk to AzuraCast or write flowsheets. The orchestrator subscribes to AzuraCast and makes every decision.
+
+```
+dj-site ──(virtual switch, Better-Auth JWT)──▶ orchestrator ──(dj-role JWT)──▶ Backend-Service ──mirror──▶ tubafrenzy
+                                                    │
+Arduino ──(WS mgmt channel + HTTP fallback)─────────┤──(Centrifugo WS + HTTP poll)──▶ AzuraCast now-playing
+```
+
+## Core design: pure reducer + impure coordinator
+
+`src/core/activation-state-machine.ts` is a **pure reducer** — `reduce(state, event) -> { state, effects[], rejection? }`. No I/O, no `Date.now()`: every event carries the `at`/`epochHour` it needs, so it is exhaustively unit-testable (deliberately mirroring the Arduino firmware's pure-`tick()` discipline). `src/core/orchestrator.ts` is the impure coordinator: it owns the state, serializes external triggers through a promise chain, and executes effects (`START_SHOW` -> `flowsheet.join()`, etc.) against the real clients.
+
+Conflict rules (networking-spec §2.7): live DJ always wins; button ≡ virtual switch (last wins); no auto-reactivation after a live DJ clears.
+
+## Layout
+
+| Path               | Role                                                                                     |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| `src/config.ts`    | zod env schema, fail-fast at boot                                                        |
+| `src/core/`        | pure reducer, conflict/breakpoint logic, state model, selectors, coordinator             |
+| `src/azuracast/`   | Centrifugo subscriber (`centrifuge` + `ws`) + HTTP poll fallback; pure `parse.ts`        |
+| `src/backend/`     | token manager (service-account sign-in + refresh), flowsheet client, pure `map-track.ts` |
+| `src/http/`        | Express app, JWKS verifier (`jose`), virtual-switch routes                               |
+| `src/persistence/` | restart-recovery snapshot                                                                |
+| `src/ports.ts`     | `ArduinoCommandSink` / `DeviceStatusProvider` interfaces (PR B supplies the real ones)   |
+
+## Auth (service account)
+
+`TokenManager` replicates wxyc-canary's `signInDj`: `POST {AUTH_URL}/sign-in/email` (with `Origin: AUTH_TRUSTED_ORIGIN`, which must be in the auth service's `BETTER_AUTH_TRUSTED_ORIGINS`) -> session + `user.id`; then `GET {AUTH_URL}/token` -> JWT. The `dj_id` is the account's **string** `user.id`. Tokens are short-lived; the manager refreshes proactively before `exp` and reactively on a 401, coalescing concurrent refreshes into one round-trip.
+
+## Commands
+
+```bash
+npm run dev          # tsx watch
+npm run build        # tsc -> dist (excludes *.test.ts)
+npm start            # node dist/index.js
+npm test             # vitest
+npm run typecheck    # tsc --noEmit (covers tests)
+npm run format       # prettier --write
+```
+
+## Configuration
+
+All env vars are documented in `.env.example` and validated by `src/config.ts` at boot (any missing/invalid value aborts startup). Key groups: server/CORS, Arduino `AUTO_DJ_KEY`, AzuraCast URLs + station shortcode, Backend-Service URL + auth service URL + Auto-DJ account credentials, JWKS/issuer/audience for verifying dj-site JWTs, and the restart-recovery snapshot path.
+
+## Testing
+
+TDD, pure modules first. `npm test` runs the unit suites (reducer, conflict/breakpoint, parse, map-track, token-manager incl. the refresh-race case, jwks-verifier) and the coordinator integration test (fakes for the flowsheet client, AzuraCast source, Arduino sink, and state store). The drivable AzuraCast mock + fake-Arduino-WS end-to-end integration lands with the management channel (PR B).
+
+## Status
+
+- **PR A (this):** core service — config, AzuraCast subscriber, BS client + token manager, activation reducer + conflict/breakpoint, virtual-switch API, healthcheck. The Arduino command sink and device status are stubbed via `src/ports.ts`.
+- **PR B (next):** management channel (WS server at `/api/auto-dj/ws` + HTTP fallback), device status, command queue, Dockerfile, AzuraCast mock, end-to-end integration tests.
+
+## Shared types
+
+Wire contracts are vendored in `src/contracts.ts` (a copy of the `@wxyc/shared/auto-dj` surface) until that package publishes — then swap the import and delete the file. See WXYC/wxyc-shared#203.
