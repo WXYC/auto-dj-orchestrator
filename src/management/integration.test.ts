@@ -113,7 +113,7 @@ describe('management channel integration', () => {
       showName: 'Auto DJ',
       tokenManager,
     });
-    const fakeAzura: AzuraCastSource = { start() {}, stop() {} };
+    const fakeAzura: AzuraCastSource = { start() {}, stop() {}, current: () => null };
     const commandQueue = new CommandQueue();
     const deviceStore = new DeviceStatusStore(60_000);
     orchestrator = new Orchestrator({
