@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on every PR (incl. stacked PRs targeting a feature branch), not just PRs into main.
   pull_request:
-    branches: [main]
 
 jobs:
   test:
