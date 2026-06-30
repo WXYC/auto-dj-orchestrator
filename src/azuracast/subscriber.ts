@@ -31,6 +31,8 @@ export interface AzuraCastSubscriberOptions {
 export interface AzuraCastSource {
   start(): void;
   stop(): void;
+  /** The latest track seen, or null if none yet. Used to post a show's opening entry. */
+  current(): NowPlaying | null;
 }
 
 export class AzuraCastSubscriber implements AzuraCastSource {
@@ -40,6 +42,7 @@ export class AzuraCastSubscriber implements AzuraCastSource {
   private connected = false;
   private lastShId = 0;
   private lastIsLive: boolean | null = null;
+  private latest: NowPlaying | null = null;
 
   constructor(
     private readonly opts: AzuraCastSubscriberOptions,
@@ -68,10 +71,15 @@ export class AzuraCastSubscriber implements AzuraCastSource {
     this.lastIsLive = null;
   }
 
+  current(): NowPlaying | null {
+    return this.latest;
+  }
+
   /** Feed a raw AzuraCast/Centrifugo payload through dedupe and emit events. */
   ingest(payload: unknown): void {
     const np = extractNowPlaying(payload);
     if (!np) return;
+    this.latest = np;
     // Emit the live signal FIRST: a live-DJ takeover arrives as one payload with
     // a new sh_id AND is_live=true. Surfacing live before the track lets the
     // orchestrator deactivate before it would post the live DJ's track as an

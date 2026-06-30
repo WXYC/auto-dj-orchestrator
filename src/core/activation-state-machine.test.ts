@@ -47,12 +47,7 @@ describe('reduce — activation', () => {
       userName: 'DJ Moonbeam',
       at: AT,
     });
-    expect(effectTypes(effects)).toEqual([
-      'START_SHOW',
-      'SUBSCRIBE_AZURACAST',
-      'SEND_ARDUINO_COMMAND',
-      'PERSIST_STATE',
-    ]);
+    expect(effectTypes(effects)).toEqual(['START_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
   });
 
   it('SHOW_STARTED moves ACTIVATING -> ACTIVE and seeds the breakpoint hour', () => {
@@ -96,12 +91,7 @@ describe('reduce — deactivation', () => {
     expect(state.phase).toBe('DEACTIVATING');
     expect(state.lastDeactivatedBy).toEqual({ source: 'virtual_switch', at: AT });
     expect(state.activatedBy).toBeUndefined();
-    expect(effectTypes(effects)).toEqual([
-      'END_SHOW',
-      'UNSUBSCRIBE_AZURACAST',
-      'SEND_ARDUINO_COMMAND',
-      'PERSIST_STATE',
-    ]);
+    expect(effectTypes(effects)).toEqual(['END_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
   });
 
   it('SHOW_ENDED moves DEACTIVATING -> INACTIVE and clears the show', () => {
@@ -187,29 +177,36 @@ describe('reduce — track posting + breakpoints', () => {
     });
   });
 
-  it('a track arriving during ACTIVATING is flushed on SHOW_STARTED', () => {
+  it('records a track during ACTIVATING for status without posting; SHOW_STARTED just persists', () => {
     const activating = reduce(initialState, {
       kind: 'ACTIVATE_REQUESTED',
       source: 'virtual_switch',
       at: AT,
     }).state;
-    const buffered = reduce(activating, { kind: 'NOW_PLAYING', track: track(5), at: AT }).state;
-    expect(buffered.currentTrack?.title).toBe('la paradoja');
-    const started = reduce(buffered, { kind: 'SHOW_STARTED', showId: 1, epochHour: 100 });
-    expect(effectTypes(started.effects)).toEqual(['POST_ENTRY', 'PERSIST_STATE']);
+    const buffered = reduce(activating, { kind: 'NOW_PLAYING', track: track(5), at: AT });
+    expect(buffered.state.currentTrack?.title).toBe('la paradoja');
+    expect(buffered.effects).toEqual([]); // no post while still ACTIVATING
+    const started = reduce(buffered.state, { kind: 'SHOW_STARTED', showId: 1, epochHour: 100 });
+    expect(effectTypes(started.effects)).toEqual(['PERSIST_STATE']);
   });
 
-  it('HOUR_TICK posts a breakpoint on a new hour, but only once per hour', () => {
+  it('HOUR_TICK emits a breakpoint but only advances the hour on BREAKPOINT_POSTED (retry-safe)', () => {
     const active = activated(); // lastBreakpointHour = 100
-    const sameHour = reduce(active, { kind: 'HOUR_TICK', epochHour: 100 });
-    expect(sameHour.effects).toEqual([]);
+    expect(reduce(active, { kind: 'HOUR_TICK', epochHour: 100 }).effects).toEqual([]); // same hour
 
-    const newHour = reduce(active, { kind: 'HOUR_TICK', epochHour: 101 });
-    expect(newHour.effects).toEqual([{ type: 'POST_BREAKPOINT' }]);
-    expect(newHour.state.lastBreakpointHour).toBe(101);
+    const tick = reduce(active, { kind: 'HOUR_TICK', epochHour: 101 });
+    expect(tick.effects).toEqual([{ type: 'POST_BREAKPOINT', epochHour: 101 }]);
+    expect(tick.state.lastBreakpointHour).toBe(100); // NOT advanced yet
 
-    const repeat = reduce(newHour.state, { kind: 'HOUR_TICK', epochHour: 101 });
-    expect(repeat.effects).toEqual([]);
+    // Until the post is confirmed, a re-tick still emits (a transient failure retries).
+    expect(reduce(tick.state, { kind: 'HOUR_TICK', epochHour: 101 }).effects).toEqual([
+      { type: 'POST_BREAKPOINT', epochHour: 101 },
+    ]);
+
+    // Confirmation advances the hour; further ticks for it are then suppressed.
+    const posted = reduce(tick.state, { kind: 'BREAKPOINT_POSTED', epochHour: 101 });
+    expect(posted.state.lastBreakpointHour).toBe(101);
+    expect(reduce(posted.state, { kind: 'HOUR_TICK', epochHour: 101 }).effects).toEqual([]);
   });
 
   it('NOW_PLAYING and HOUR_TICK are no-ops while INACTIVE', () => {
@@ -231,7 +228,7 @@ describe('reduce — restart recovery', () => {
     expect(state.phase).toBe('ACTIVE');
     expect(state.showId).toBe(789);
     expect(state.lastBreakpointHour).toBe(100);
-    expect(effectTypes(effects)).toEqual(['SUBSCRIBE_AZURACAST']);
+    expect(effectTypes(effects)).toEqual(['PERSIST_STATE']);
     expect(effectTypes(effects)).not.toContain('START_SHOW');
   });
 });

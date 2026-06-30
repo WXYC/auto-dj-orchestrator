@@ -35,7 +35,15 @@ export function virtualSwitchRouter(deps: {
         .json({ error: 'Auto-DJ is already active', status: orchestrator.getStatus() });
       return;
     }
-    res.status(200).json(orchestrator.getStatus());
+    // The reducer accepted the request, but a downstream effect (e.g. the BS
+    // show-start) may have failed and rolled the state back. Surface that as a
+    // 502 rather than a misleading 200.
+    const status = orchestrator.getStatus();
+    if (!status.active) {
+      res.status(502).json({ error: 'Activation failed (backend unavailable)', status });
+      return;
+    }
+    res.status(200).json(status);
   });
 
   router.post('/deactivate', requireAuth(verifier, 'dj'), async (_req, res) => {

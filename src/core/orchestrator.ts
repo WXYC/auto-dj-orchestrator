@@ -117,13 +117,20 @@ export class Orchestrator {
     if (!snap || snap.showId === undefined) return;
     if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return;
 
+    // Distinguish "definitely off-air" (probe returned false) from "couldn't
+    // tell" (probe threw — transient auth/BS error). A definitive off-air starts
+    // INACTIVE; an indeterminate probe trusts the snapshot and re-attaches, so a
+    // routine redeploy during a transient BS blip doesn't orphan a live show
+    // (which then couldn't be ended via the API).
     let onAir = false;
+    let probeFailed = false;
     try {
       onAir = await this.deps.flowsheet.isOnAir();
     } catch (err) {
-      this.deps.logger.warn({ err }, 'recovery on-air probe failed; starting inactive');
+      probeFailed = true;
+      this.deps.logger.warn({ err }, 'recovery on-air probe failed; trusting the snapshot');
     }
-    if (!onAir) {
+    if (!onAir && !probeFailed) {
       this.deps.logger.info('snapshot was active but BS reports off-air; starting inactive');
       return;
     }
@@ -202,6 +209,13 @@ export class Orchestrator {
       case 'START_SHOW': {
         const showId = await this.deps.flowsheet.join();
         await this.applyEvent({ kind: 'SHOW_STARTED', showId, epochHour: epochHour(this.now()) });
+        // Post the currently-playing track as the show's opening entry (the
+        // subscriber runs continuously, so no NOW_PLAYING arrives just for
+        // having activated).
+        const opening = this.deps.azuracast.current();
+        if (opening) {
+          await this.applyEvent({ kind: 'NOW_PLAYING', track: opening, at: this.nowIso() });
+        }
         break;
       }
       case 'END_SHOW': {
@@ -214,12 +228,8 @@ export class Orchestrator {
         break;
       case 'POST_BREAKPOINT':
         await this.deps.flowsheet.addBreakpoint();
-        break;
-      case 'SUBSCRIBE_AZURACAST':
-        this.deps.azuracast.start();
-        break;
-      case 'UNSUBSCRIBE_AZURACAST':
-        this.deps.azuracast.stop();
+        // Mark the hour posted only after success, so a transient failure retries.
+        await this.applyEvent({ kind: 'BREAKPOINT_POSTED', epochHour: effect.epochHour });
         break;
       case 'SEND_ARDUINO_COMMAND':
         this.deps.arduino.send(effect.action);
@@ -237,11 +247,10 @@ export class Orchestrator {
    */
   private async handleEffectFailure(effect: Effect): Promise<boolean> {
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {
-      // Activation failed: revert to INACTIVE and undo the partial activation
-      // (stop the subscriber, pause the Arduino) the rest of the batch would
-      // otherwise have completed.
+      // Activation failed: revert to INACTIVE and pause the Arduino (the rest of
+      // the batch, which would have sent 'resume', is abandoned). The subscriber
+      // keeps running — it monitors AzuraCast continuously.
       this.state = { ...initialState };
-      this.deps.azuracast.stop();
       this.deps.arduino.send('pause');
       await this.deps.stateStore.save(snapshotOf(this.state));
       return true;
@@ -249,7 +258,6 @@ export class Orchestrator {
     if (effect.type === 'END_SHOW' && this.state.phase === 'DEACTIVATING') {
       // Treat as ended; better INACTIVE than stuck deactivating. Finish the
       // cleanup the aborted batch would have done.
-      this.deps.azuracast.stop();
       this.deps.arduino.send('pause');
       await this.applyEvent({ kind: 'SHOW_ENDED' });
       return true;
