@@ -4,7 +4,7 @@
  * malformed/unknown frames parse to null and are dropped.
  */
 import { z } from 'zod';
-import type { AutoDJCommand, AutoDJWebSocketMessage } from '../contracts.js';
+import type { AutoDJWebSocketMessage } from '../contracts.js';
 
 const stateEnum = z.enum(['BOOTING', 'CONNECTING', 'CONNECTED', 'ERROR_STATE']);
 
@@ -54,25 +54,19 @@ const errorReport = z.object({
   count: z.number(),
 });
 
-const nowPlaying = z.object({
-  type: z.literal('now_playing'),
-  sh_id: z.number(),
-  artist: z.string(),
-  title: z.string(),
-  album: z.string(),
-  is_live: z.boolean(),
-});
-
-/** Messages the Arduino sends to the orchestrator. */
-const inbound = z.discriminatedUnion('type', [
-  heartbeat,
-  ack,
-  buttonToggle,
-  errorReport,
-  nowPlaying,
-]);
+/** Messages the Arduino sends to the orchestrator. (It never sends now_playing —
+ *  the orchestrator subscribes to AzuraCast itself.) */
+const inbound = z.discriminatedUnion('type', [heartbeat, ack, buttonToggle, errorReport]);
 
 export type InboundMessage = z.infer<typeof inbound>;
+
+// Compile-time tie to the wire contract: every inbound variant must be assignable
+// to AutoDJWebSocketMessage, so a future contract change (e.g. when
+// @wxyc/shared/auto-dj lands) that these zod schemas don't track fails the build
+// instead of silently dropping real Arduino frames at runtime.
+type _AssertInboundMatchesContract = InboundMessage extends AutoDJWebSocketMessage ? true : never;
+const _inboundContractTie: _AssertInboundMatchesContract = true;
+void _inboundContractTie;
 
 /** Validate an already-parsed value (HTTP bodies arrive pre-parsed by express.json). */
 export function validateInbound(value: unknown): InboundMessage | null {
@@ -89,6 +83,6 @@ export function parseInbound(raw: string): InboundMessage | null {
   }
 }
 
-export function serialize(message: AutoDJWebSocketMessage | AutoDJCommand): string {
+export function serialize(message: AutoDJWebSocketMessage): string {
   return JSON.stringify(message);
 }

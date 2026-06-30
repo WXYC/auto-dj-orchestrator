@@ -50,7 +50,8 @@ export function arduinoHttpRouter(deps: ArduinoHttpDeps): Router {
   });
 
   router.post('/commands/ack', (req, res) => {
-    const id = (req.body as { id?: unknown }).id;
+    // req.body is undefined for an empty / non-JSON body — guard before reading.
+    const id = (req.body as { id?: unknown } | undefined)?.id;
     if (typeof id === 'string') deps.commandQueue.ack(id);
     res.sendStatus(200);
   });

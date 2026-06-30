@@ -25,11 +25,10 @@ describe('DeviceStatusStore', () => {
   });
 
   it('reports online and maps relay state', () => {
-    let now = 1000;
+    const now = 1000;
     const store = new DeviceStatusStore(60_000, () => now);
     store.update(hb({ relay_auto_dj_active: true, transport: 'wifi' }));
-    const summary = store.summary();
-    expect(summary).toMatchObject({
+    expect(store.summary()).toMatchObject({
       online: true,
       transport: 'wifi',
       relayState: 'auto_dj_active',
@@ -37,7 +36,14 @@ describe('DeviceStatusStore', () => {
 
     store.update(hb({ relay_auto_dj_active: false }));
     expect(store.summary()?.relayState).toBe('dj_live');
-    void now;
+  });
+
+  it('keeps the last reported relay state when a heartbeat omits the field', () => {
+    const store = new DeviceStatusStore(60_000, () => 1000);
+    store.update(hb({ relay_auto_dj_active: false })); // live DJ
+    expect(store.summary()?.relayState).toBe('dj_live');
+    store.update(hb({})); // omits the field
+    expect(store.summary()?.relayState).toBe('dj_live'); // not flipped to auto_dj_active
   });
 
   it('goes offline once the heartbeat is older than the threshold', () => {
