@@ -58,7 +58,12 @@ export class ManagementWsServer {
 
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     const path = (req.url ?? '').split('?')[0];
-    if (path !== WS_PATH) return; // let other upgrade handlers (if any) try
+    if (path !== WS_PATH) {
+      // This is the only 'upgrade' listener, so an unmatched path must be closed
+      // here or the socket dangles (FD leak / pre-auth DoS).
+      socket.destroy();
+      return;
+    }
     if (!keysMatch(req.headers['x-auto-dj-key'] as string | undefined, this.deps.authKey)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -112,9 +117,6 @@ export class ManagementWsServer {
           { module: msg.module, code: msg.code, count: msg.count },
           `arduino error: ${msg.message}`,
         );
-        break;
-      case 'now_playing':
-        // Unused with direct Centrifugo; the orchestrator subscribes to AzuraCast itself.
         break;
     }
   }

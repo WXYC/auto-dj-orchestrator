@@ -108,4 +108,12 @@ describe('arduino HTTP fallback router', () => {
   it('rejects a malformed heartbeat body (400)', async () => {
     expect((await post('/api/auto-dj/heartbeat', { type: 'heartbeat' })).status).toBe(400);
   });
+
+  it('handles an ack POST with no body without throwing a 500', async () => {
+    const res = await fetch(`${url}/api/auto-dj/commands/ack`, {
+      method: 'POST',
+      headers: { 'X-Auto-DJ-Key': KEY }, // no Content-Type / body
+    });
+    expect(res.status).toBe(200);
+  });
 });

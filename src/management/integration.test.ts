@@ -159,6 +159,13 @@ describe('management channel integration', () => {
     await expect(new Promise((_r, reject) => ws.once('error', reject))).rejects.toBeTruthy();
   });
 
+  it('destroys an upgrade to a non-matching path (no dangling socket)', async () => {
+    const ws = new WebSocket(`ws://localhost:${port}/api/auto-dj/wrong`, {
+      headers: { 'x-auto-dj-key': AUTH_KEY },
+    });
+    await expect(new Promise((_r, reject) => ws.once('error', reject))).rejects.toBeTruthy();
+  });
+
   it('button_toggle activates, creates the show as the Auto-DJ account, and acks with result.active', async () => {
     const ws = await connectArduino();
     ws.send(JSON.stringify({ type: 'button_toggle', timestamp: 1709852100 }));
