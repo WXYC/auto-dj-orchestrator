@@ -76,6 +76,9 @@ async function main(): Promise<void> {
   const app = createApp({ orchestrator, verifier, corsAllowedOrigins: config.corsAllowedOrigins });
   const server = createServer(app);
 
+  // The subscriber runs continuously (not per-activation) so the orchestrator
+  // always knows now-playing + is_live; activation only gates flowsheet writes.
+  azuracast.start();
   await orchestrator.recover();
   orchestrator.start();
 

@@ -15,7 +15,12 @@ const track = (shId: number): NowPlaying => ({
   isLive: false,
 });
 
-function harness(opts?: { isOnAir?: boolean; snapshot?: Snapshot | null; startHourMs?: number }) {
+function harness(opts?: {
+  isOnAir?: boolean;
+  snapshot?: Snapshot | null;
+  startHourMs?: number;
+  currentTrack?: NowPlaying | null;
+}) {
   let nowMs = opts?.startHourMs ?? 100 * HOUR;
   let nextShowId = 700;
   const flowsheet = {
@@ -25,7 +30,11 @@ function harness(opts?: { isOnAir?: boolean; snapshot?: Snapshot | null; startHo
     addBreakpoint: vi.fn(async () => {}),
     isOnAir: vi.fn(async () => opts?.isOnAir ?? false),
   };
-  const azuracast = { start: vi.fn(), stop: vi.fn() } satisfies AzuraCastSource;
+  const azuracast = {
+    start: vi.fn(),
+    stop: vi.fn(),
+    current: vi.fn(() => opts?.currentTrack ?? null),
+  } satisfies AzuraCastSource;
   const arduino = { send: vi.fn() } satisfies ArduinoCommandSink;
   let saved: Snapshot | null = opts?.snapshot ?? null;
   const stateStore = {
@@ -59,7 +68,6 @@ describe('Orchestrator — happy path', () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1', userName: 'DJ Moonbeam' });
     expect(h.flowsheet.join).toHaveBeenCalledTimes(1);
-    expect(h.azuracast.start).toHaveBeenCalled();
     expect(h.arduino.send).toHaveBeenCalledWith('resume');
     let status = h.orchestrator.getStatus();
     expect(status.active).toBe(true);
@@ -82,19 +90,24 @@ describe('Orchestrator — happy path', () => {
 });
 
 describe('Orchestrator — conflict resolution', () => {
-  it('a live DJ preempts auto-DJ and there is no auto-reactivation', async () => {
+  it('a live DJ preempts auto-DJ; no auto-reactivation, but the latch clears so a human can re-activate', async () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1' });
     await h.orchestrator.relayState(true); // live DJ on air
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
-    expect(h.azuracast.stop).toHaveBeenCalled();
     const status = h.orchestrator.getStatus();
     expect(status.active).toBe(false);
     expect(status.lastDeactivatedBy).toEqual({ source: 'relay', detail: 'Live DJ detected' });
 
-    await h.orchestrator.relayState(false); // live DJ leaves
-    expect(h.orchestrator.getStatus().active).toBe(false); // stays off
-    expect(h.flowsheet.join).toHaveBeenCalledTimes(1); // never re-joined
+    await h.orchestrator.relayState(false); // live DJ leaves (subscriber runs continuously)
+    expect(h.orchestrator.getStatus().active).toBe(false); // no AUTO reactivation
+    expect(h.flowsheet.join).toHaveBeenCalledTimes(1); // not auto re-joined
+
+    // The liveDj latch cleared, so an explicit re-activation now succeeds.
+    const reactivate = await h.orchestrator.activate({ userId: 'u1' });
+    expect(reactivate.rejection).toBeUndefined();
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    expect(h.flowsheet.join).toHaveBeenCalledTimes(2);
   });
 
   it('rejects a second activate while already active', async () => {
@@ -120,7 +133,6 @@ describe('Orchestrator — restart recovery', () => {
     expect(status.active).toBe(true);
     expect(status.showId).toBe(789);
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // no duplicate join
-    expect(h.azuracast.start).toHaveBeenCalled();
   });
 
   it('stays inactive when the snapshot is active but BS reports off-air', async () => {
@@ -128,7 +140,15 @@ describe('Orchestrator — restart recovery', () => {
     const h = harness({ snapshot, isOnAir: false });
     await h.orchestrator.recover();
     expect(h.orchestrator.getStatus().active).toBe(false);
-    expect(h.azuracast.start).not.toHaveBeenCalled();
+  });
+
+  it('re-attaches optimistically when the on-air probe throws (avoids orphaning a live show)', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockRejectedValueOnce(new Error('transient BS error'));
+    await h.orchestrator.recover();
+    expect(h.orchestrator.getStatus().active).toBe(true); // trusts the snapshot
+    expect(h.flowsheet.join).not.toHaveBeenCalled();
   });
 
   it('finishes an interrupted deactivation on recovery instead of re-activating', async () => {
@@ -138,7 +158,26 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.orchestrator.getStatus().active).toBe(false);
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // teardown finished
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT re-activated
-    expect(h.azuracast.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('Orchestrator — opening entry + breakpoint retry', () => {
+  it('posts the currently-playing track as the show opening entry on activate', async () => {
+    const opening = track(42);
+    const h = harness({ currentTrack: opening });
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(opening);
+  });
+
+  it('retries the hourly breakpoint after a transient failure instead of skipping the hour', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' }); // seeds lastBreakpointHour = 100
+    h.setNow(101 * HOUR);
+    h.flowsheet.addBreakpoint.mockRejectedValueOnce(new Error('transient'));
+    await h.orchestrator.hourTick(); // fails — hour NOT marked posted
+    expect(h.flowsheet.addBreakpoint).toHaveBeenCalledTimes(1);
+    await h.orchestrator.hourTick(); // retries the same hour
+    expect(h.flowsheet.addBreakpoint).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -148,8 +187,7 @@ describe('Orchestrator — failure handling', () => {
     h.flowsheet.join.mockRejectedValueOnce(new Error('BS down'));
     await h.orchestrator.activate({ userId: 'u1' });
     expect(h.orchestrator.getStatus().active).toBe(false);
-    // The rest of the activate batch is abandoned: no subscribe, no 'resume'.
-    expect(h.azuracast.start).not.toHaveBeenCalled();
+    // The rest of the activate batch is abandoned: no 'resume', and a pause is sent.
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });

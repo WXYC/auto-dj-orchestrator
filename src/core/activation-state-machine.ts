@@ -30,15 +30,14 @@ export type Event =
   | { kind: 'SHOW_STARTED'; showId: number; epochHour: number }
   | { kind: 'SHOW_ENDED' }
   | { kind: 'HOUR_TICK'; epochHour: number }
+  | { kind: 'BREAKPOINT_POSTED'; epochHour: number }
   | { kind: 'RECOVERED'; showId: number; activatedBy: Activation; epochHour: number };
 
 export type Effect =
   | { type: 'START_SHOW' }
   | { type: 'END_SHOW' }
   | { type: 'POST_ENTRY'; track: NowPlaying }
-  | { type: 'POST_BREAKPOINT' }
-  | { type: 'SUBSCRIBE_AZURACAST' }
-  | { type: 'UNSUBSCRIBE_AZURACAST' }
+  | { type: 'POST_BREAKPOINT'; epochHour: number }
   | { type: 'SEND_ARDUINO_COMMAND'; action: 'pause' | 'resume' }
   | { type: 'PERSIST_STATE' };
 
@@ -57,10 +56,14 @@ const reject = (state: ActivationState, rejection: RejectionCode): ReduceResult 
   rejection,
 });
 
+// The AzuraCast subscriber runs continuously (boot to shutdown), so activation
+// only gates *writes*; we no longer SUBSCRIBE/UNSUBSCRIBE per activation. This
+// keeps the live-DJ (is_live) signal current even while auto-DJ is inactive, so
+// `liveDj` can clear when a live DJ leaves.
+
 /** Effects emitted when auto-DJ turns on. */
 const ACTIVATE_EFFECTS: Effect[] = [
   { type: 'START_SHOW' },
-  { type: 'SUBSCRIBE_AZURACAST' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'resume' },
   { type: 'PERSIST_STATE' },
 ];
@@ -68,7 +71,6 @@ const ACTIVATE_EFFECTS: Effect[] = [
 /** Effects emitted when auto-DJ turns off. */
 const DEACTIVATE_EFFECTS: Effect[] = [
   { type: 'END_SHOW' },
-  { type: 'UNSUBSCRIBE_AZURACAST' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'pause' },
   { type: 'PERSIST_STATE' },
 ];
@@ -141,8 +143,9 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
         album: event.track.album,
         detectedAt: event.at,
       };
-      // Post entries only once the show exists. During ACTIVATING we remember the
-      // track and post it on SHOW_STARTED so the first track isn't dropped.
+      // Post entries only once the show exists. The opening entry of a new show
+      // is posted by the coordinator (which feeds the current track on
+      // SHOW_STARTED), so ACTIVATING only records the track for status display.
       if (state.phase === 'ACTIVE') {
         return {
           state: { ...state, currentTrack: detected },
@@ -157,20 +160,6 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
 
     case 'SHOW_STARTED': {
       if (state.phase !== 'ACTIVATING') return { state, effects: [] };
-      const effects: Effect[] = [{ type: 'PERSIST_STATE' }];
-      // Flush a track that arrived during activation.
-      if (state.currentTrack) {
-        effects.unshift({
-          type: 'POST_ENTRY',
-          track: {
-            shId: 0,
-            artist: state.currentTrack.artist,
-            title: state.currentTrack.title,
-            album: state.currentTrack.album,
-            isLive: false,
-          },
-        });
-      }
       return {
         state: {
           ...state,
@@ -178,7 +167,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           showId: event.showId,
           lastBreakpointHour: event.epochHour,
         },
-        effects,
+        effects: [{ type: 'PERSIST_STATE' }],
       };
     }
 
@@ -201,14 +190,23 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
       if (state.lastBreakpointHour !== undefined && event.epochHour <= state.lastBreakpointHour) {
         return { state, effects: [] };
       }
-      return {
-        state: { ...state, lastBreakpointHour: event.epochHour },
-        effects: [{ type: 'POST_BREAKPOINT' }],
-      };
+      // Do NOT advance lastBreakpointHour here — only after the post succeeds
+      // (BREAKPOINT_POSTED). A transient failure then retries on the next tick
+      // instead of permanently skipping the hour.
+      return { state, effects: [{ type: 'POST_BREAKPOINT', epochHour: event.epochHour }] };
+    }
+
+    case 'BREAKPOINT_POSTED': {
+      if (state.phase !== 'ACTIVE') return { state, effects: [] };
+      if (state.lastBreakpointHour !== undefined && event.epochHour <= state.lastBreakpointHour) {
+        return { state, effects: [] };
+      }
+      return { state: { ...state, lastBreakpointHour: event.epochHour }, effects: [] };
     }
 
     case 'RECOVERED': {
-      // Re-attach to an existing show after a restart. No START_SHOW (it exists).
+      // Re-attach to an existing show after a restart. No START_SHOW (it exists);
+      // the subscriber already runs continuously, so no SUBSCRIBE either.
       return {
         state: {
           ...state,
@@ -218,7 +216,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           lastBreakpointHour: event.epochHour,
           currentTrack: null,
         },
-        effects: [{ type: 'SUBSCRIBE_AZURACAST' }],
+        effects: [{ type: 'PERSIST_STATE' }],
       };
     }
   }
