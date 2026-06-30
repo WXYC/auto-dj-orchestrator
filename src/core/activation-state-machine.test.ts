@@ -177,6 +177,18 @@ describe('reduce — track posting + breakpoints', () => {
     });
   });
 
+  it('dedupes consecutive NOW_PLAYING with the same sh_id (no double opening entry)', () => {
+    const active = activated();
+    const first = reduce(active, { kind: 'NOW_PLAYING', track: track(9), at: AT });
+    expect(first.effects).toEqual([{ type: 'POST_ENTRY', track: track(9) }]);
+    expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(9), at: AT }).effects).toEqual(
+      [],
+    );
+    expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(10), at: AT }).effects).toEqual([
+      { type: 'POST_ENTRY', track: track(10) },
+    ]);
+  });
+
   it('records a track during ACTIVATING for status without posting; SHOW_STARTED just persists', () => {
     const activating = reduce(initialState, {
       kind: 'ACTIVATE_REQUESTED',
