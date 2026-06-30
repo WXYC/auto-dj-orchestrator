@@ -49,6 +49,9 @@ export class AzuraCastSubscriber implements AzuraCastSource {
   }
 
   start(): void {
+    // Idempotent: a second start() without an intervening stop() would orphan
+    // the prior poll timer and open a duplicate Centrifuge connection.
+    if (this.pollTimer || this.centrifuge) return;
     this.connectCentrifuge();
     this.schedulePoll();
   }
@@ -58,19 +61,28 @@ export class AzuraCastSubscriber implements AzuraCastSource {
     this.pollTimer = null;
     this.centrifuge?.disconnect();
     this.centrifuge = null;
+    this.connected = false;
+    // Reset dedupe state so a later re-subscribe re-emits the current track /
+    // live state (the instance is reused across activate/deactivate cycles).
+    this.lastShId = 0;
+    this.lastIsLive = null;
   }
 
   /** Feed a raw AzuraCast/Centrifugo payload through dedupe and emit events. */
   ingest(payload: unknown): void {
     const np = extractNowPlaying(payload);
     if (!np) return;
-    if (np.shId > 0 && np.shId !== this.lastShId) {
-      this.lastShId = np.shId;
-      this.cb.onTrack(np);
-    }
+    // Emit the live signal FIRST: a live-DJ takeover arrives as one payload with
+    // a new sh_id AND is_live=true. Surfacing live before the track lets the
+    // orchestrator deactivate before it would post the live DJ's track as an
+    // auto-DJ entry.
     if (this.lastIsLive === null || np.isLive !== this.lastIsLive) {
       this.lastIsLive = np.isLive;
       this.cb.onLive(np.isLive);
+    }
+    if (np.shId > 0 && np.shId !== this.lastShId) {
+      this.lastShId = np.shId;
+      this.cb.onTrack(np);
     }
   }
 

@@ -130,4 +130,27 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.orchestrator.getStatus().active).toBe(false);
     expect(h.azuracast.start).not.toHaveBeenCalled();
   });
+
+  it('finishes an interrupted deactivation on recovery instead of re-activating', async () => {
+    const snapshot: Snapshot = { phase: 'DEACTIVATING', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // teardown finished
+    expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT re-activated
+    expect(h.azuracast.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('Orchestrator — failure handling', () => {
+  it('rolls back to INACTIVE and pauses the Arduino when the show start fails', async () => {
+    const h = harness();
+    h.flowsheet.join.mockRejectedValueOnce(new Error('BS down'));
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    // The rest of the activate batch is abandoned: no subscribe, no 'resume'.
+    expect(h.azuracast.start).not.toHaveBeenCalled();
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
+  });
 });

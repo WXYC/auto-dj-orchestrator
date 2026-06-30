@@ -32,6 +32,12 @@ describe('hasRole', () => {
     expect(hasRole(undefined, 'member')).toBe(false);
     expect(hasRole('bogus', 'member')).toBe(false);
   });
+
+  it('normalizes better-auth system roles admin/owner to stationManager', () => {
+    expect(hasRole('admin', 'dj')).toBe(true);
+    expect(hasRole('owner', 'dj')).toBe(true);
+    expect(hasRole('admin', 'stationManager')).toBe(true);
+  });
 });
 
 describe('createJwtVerifier', () => {

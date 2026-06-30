@@ -52,4 +52,32 @@ describe('AzuraCastSubscriber.ingest', () => {
     expect(tracks).toEqual([]);
     expect(live).toEqual([]);
   });
+
+  it('re-emits the current track after stop() (dedupe state is reset for reuse)', () => {
+    const { sub, tracks } = makeSubscriber();
+    sub.ingest(payload(7, false));
+    expect(tracks.map((t) => t.shId)).toEqual([7]);
+    sub.stop(); // deactivate
+    sub.ingest(payload(7, false)); // reactivate, same song still playing
+    expect(tracks.map((t) => t.shId)).toEqual([7, 7]); // re-emitted, not suppressed
+  });
+
+  it('emits the live signal before the track on a single live-takeover payload', () => {
+    const order: string[] = [];
+    const sub = new AzuraCastSubscriber(
+      {
+        wsUrl: 'wss://example/ws',
+        httpUrl: 'https://example/np.json',
+        stationShortcode: 'wxyc',
+        safetyPollMs: 60_000,
+        fallbackPollMs: 20_000,
+        fetchFn: vi.fn() as unknown as typeof fetch,
+      },
+      { onTrack: () => order.push('track'), onLive: () => order.push('live') },
+    );
+    sub.ingest(payload(1, false)); // seed: live=false, track 1
+    sub.ingest(payload(2, true)); // takeover: new sh_id AND is_live in one payload
+    expect(order).toEqual(['live', 'track', 'live', 'track']);
+    // The second pair is live-then-track: deactivate is enqueued before the entry post.
+  });
 });
