@@ -48,6 +48,8 @@ export interface ActivationState {
   lastDeactivatedBy?: Activation;
   showId?: number;
   currentTrack: DetectedTrack | null;
+  /** sh_id of the last entry posted in the current show; dedupes the opening entry vs a racing now-playing callback. */
+  lastPostedShId?: number;
   /** epoch-hour index of the last posted breakpoint (undefined until a show starts). */
   lastBreakpointHour?: number;
   /** Last known live-DJ signal (relay open or AzuraCast is_live). */

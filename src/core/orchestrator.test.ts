@@ -169,6 +169,14 @@ describe('Orchestrator — opening entry + breakpoint retry', () => {
     expect(h.flowsheet.addEntry).toHaveBeenCalledWith(opening);
   });
 
+  it('does not double-post the opening track when a same-sh_id now-playing callback races in', async () => {
+    const opening = track(42);
+    const h = harness({ currentTrack: opening });
+    await h.orchestrator.activate({ userId: 'u1' }); // posts opening (sh_id 42)
+    await h.orchestrator.onTrack(track(42)); // the subscriber callback for the same track
+    expect(h.flowsheet.addEntry).toHaveBeenCalledTimes(1);
+  });
+
   it('retries the hourly breakpoint after a transient failure instead of skipping the hour', async () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1' }); // seeds lastBreakpointHour = 100

@@ -76,10 +76,13 @@ async function main(): Promise<void> {
   const app = createApp({ orchestrator, verifier, corsAllowedOrigins: config.corsAllowedOrigins });
   const server = createServer(app);
 
-  // The subscriber runs continuously (not per-activation) so the orchestrator
-  // always knows now-playing + is_live; activation only gates flowsheet writes.
-  azuracast.start();
+  // Recover from a persisted snapshot first (based on Backend-Service state),
+  // THEN start the continuous subscriber. If recovery re-attached a show but a
+  // live DJ is actually on air, the subscriber's first poll emits is_live before
+  // any track (ingest order), so RELAY_STATE force-deactivates before any live
+  // track is posted — self-correcting "live DJ wins".
   await orchestrator.recover();
+  azuracast.start();
   orchestrator.start();
 
   server.listen(config.ORCHESTRATOR_PORT, () => {

@@ -147,8 +147,13 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
       // is posted by the coordinator (which feeds the current track on
       // SHOW_STARTED), so ACTIVATING only records the track for status display.
       if (state.phase === 'ACTIVE') {
+        // Dedupe by sh_id: the coordinator's opening-entry post and a now-playing
+        // callback that raced in during flowsheet.join() can carry the same track.
+        if (state.lastPostedShId === event.track.shId) {
+          return { state: { ...state, currentTrack: detected }, effects: [] };
+        }
         return {
-          state: { ...state, currentTrack: detected },
+          state: { ...state, currentTrack: detected, lastPostedShId: event.track.shId },
           effects: [{ type: 'POST_ENTRY', track: event.track }],
         };
       }
@@ -166,6 +171,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           phase: 'ACTIVE',
           showId: event.showId,
           lastBreakpointHour: event.epochHour,
+          lastPostedShId: undefined, // fresh show: let the opening entry post
         },
         effects: [{ type: 'PERSIST_STATE' }],
       };
@@ -180,6 +186,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           showId: undefined,
           currentTrack: null,
           lastBreakpointHour: undefined,
+          lastPostedShId: undefined,
         },
         effects: [{ type: 'PERSIST_STATE' }],
       };
@@ -215,6 +222,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           activatedBy: event.activatedBy,
           lastBreakpointHour: event.epochHour,
           currentTrack: null,
+          lastPostedShId: undefined,
         },
         effects: [{ type: 'PERSIST_STATE' }],
       };
