@@ -114,35 +114,50 @@ export class Orchestrator {
   /** Boot recovery: re-attach to an in-progress show only if BS confirms it is on air. */
   async recover(): Promise<void> {
     const snap = await this.deps.stateStore.load();
-    const wasActive =
-      snap &&
-      (snap.phase === 'ACTIVE' || snap.phase === 'DEACTIVATING') &&
-      snap.showId !== undefined;
-    if (wasActive) {
-      let onAir = false;
-      try {
-        onAir = await this.deps.flowsheet.isOnAir();
-      } catch (err) {
-        this.deps.logger.warn({ err }, 'recovery on-air probe failed; starting inactive');
-      }
-      if (onAir) {
-        await this.enqueue(() =>
-          this.applyEvent({
-            kind: 'RECOVERED',
-            showId: snap!.showId!,
-            activatedBy: snap!.activatedBy ?? {
-              source: 'virtual_switch',
-              detail: 'recovered',
-              at: this.nowIso(),
-            },
-            epochHour: epochHour(this.now()),
-          }),
-        );
-        this.deps.logger.info({ showId: snap!.showId }, 'recovered active auto-dj show');
-        return;
-      }
-      this.deps.logger.info('snapshot was active but BS reports off-air; starting inactive');
+    if (!snap || snap.showId === undefined) return;
+    if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return;
+
+    let onAir = false;
+    try {
+      onAir = await this.deps.flowsheet.isOnAir();
+    } catch (err) {
+      this.deps.logger.warn({ err }, 'recovery on-air probe failed; starting inactive');
     }
+    if (!onAir) {
+      this.deps.logger.info('snapshot was active but BS reports off-air; starting inactive');
+      return;
+    }
+
+    if (snap.phase === 'DEACTIVATING') {
+      // A teardown was in progress when we died — finish it, do NOT re-activate
+      // (that would resurrect a show the operator was turning off, possibly on
+      // top of a live DJ).
+      try {
+        await this.deps.flowsheet.end();
+      } catch (err) {
+        this.deps.logger.warn({ err }, 'recovery: failed to finish interrupted deactivation');
+      }
+      this.deps.logger.info(
+        { showId: snap.showId },
+        'finished an interrupted deactivation on recovery',
+      );
+      return;
+    }
+
+    // phase ACTIVE: re-attach to the running show.
+    await this.enqueue(() =>
+      this.applyEvent({
+        kind: 'RECOVERED',
+        showId: snap.showId!,
+        activatedBy: snap.activatedBy ?? {
+          source: 'virtual_switch',
+          detail: 'recovered',
+          at: this.nowIso(),
+        },
+        epochHour: epochHour(this.now()),
+      }),
+    );
+    this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
   }
 
   // ── Internals ──────────────────────────────────────────────────────────
@@ -174,7 +189,10 @@ export class Orchestrator {
         await this.runEffect(effect);
       } catch (err) {
         this.deps.logger.error({ err, effect: effect.type }, 'effect failed');
-        await this.handleEffectFailure(effect);
+        // If the handler rolled state back (a failed show start/end), abandon the
+        // rest of THIS batch — the remaining effects were computed for the old
+        // state and would otherwise re-subscribe / resume after a rollback.
+        if (await this.handleEffectFailure(effect)) return;
       }
     }
   }
@@ -212,15 +230,30 @@ export class Orchestrator {
     }
   }
 
-  /** Keep the machine from getting stuck if a show start/end fails. */
-  private async handleEffectFailure(effect: Effect): Promise<void> {
+  /**
+   * Keep the machine from getting stuck if a show start/end fails, restoring a
+   * consistent software + hardware state. Returns true when it handled a
+   * rollback (so runEffects abandons the rest of the batch).
+   */
+  private async handleEffectFailure(effect: Effect): Promise<boolean> {
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {
+      // Activation failed: revert to INACTIVE and undo the partial activation
+      // (stop the subscriber, pause the Arduino) the rest of the batch would
+      // otherwise have completed.
       this.state = { ...initialState };
-      await this.deps.stateStore.save(snapshotOf(this.state));
       this.deps.azuracast.stop();
-    } else if (effect.type === 'END_SHOW' && this.state.phase === 'DEACTIVATING') {
-      // Treat as ended; better INACTIVE than stuck deactivating.
-      await this.applyEvent({ kind: 'SHOW_ENDED' });
+      this.deps.arduino.send('pause');
+      await this.deps.stateStore.save(snapshotOf(this.state));
+      return true;
     }
+    if (effect.type === 'END_SHOW' && this.state.phase === 'DEACTIVATING') {
+      // Treat as ended; better INACTIVE than stuck deactivating. Finish the
+      // cleanup the aborted batch would have done.
+      this.deps.azuracast.stop();
+      this.deps.arduino.send('pause');
+      await this.applyEvent({ kind: 'SHOW_ENDED' });
+      return true;
+    }
+    return false; // POST_ENTRY / POST_BREAKPOINT / etc: logged, continue.
   }
 }

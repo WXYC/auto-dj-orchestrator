@@ -9,10 +9,22 @@ export type Role = 'member' | 'dj' | 'musicDirector' | 'stationManager';
 
 const RANK: Record<Role, number> = { member: 0, dj: 1, musicDirector: 2, stationManager: 3 };
 
+/**
+ * Map a raw JWT role claim to a station role, mirroring Backend-Service's
+ * `normalizeRole`: better-auth system roles (`admin`/`owner`) outrank a DJ and
+ * are treated as `stationManager`. Unknown roles return undefined.
+ */
+function normalizeRole(role: string | undefined): Role | undefined {
+  if (!role) return undefined;
+  if (role === 'admin' || role === 'owner') return 'stationManager';
+  return role in RANK ? (role as Role) : undefined;
+}
+
 /** True when `role` is at least `min` in the WXYC role hierarchy. */
 export function hasRole(role: string | undefined, min: Role): boolean {
-  if (!role || !(role in RANK)) return false;
-  return RANK[role as Role] >= RANK[min];
+  const normalized = normalizeRole(role);
+  if (!normalized) return false;
+  return RANK[normalized] >= RANK[min];
 }
 
 export interface AuthUser {

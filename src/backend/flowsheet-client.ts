@@ -32,7 +32,10 @@ export class FlowsheetClient {
     const data = (await this.request('POST', '/flowsheet/join', {
       dj_id: djId,
       show_name: this.opts.showName,
-    })) as { id: number };
+    })) as { id?: number };
+    if (typeof data.id !== 'number') {
+      throw new Error('BS /flowsheet/join returned no show id');
+    }
     this.opts.logger?.info({ showId: data.id }, 'auto-dj show started');
     return data.id;
   }
@@ -74,7 +77,15 @@ export class FlowsheetClient {
       const text = await resp.text().catch(() => '');
       throw new Error(`BS ${method} ${path} -> ${resp.status} ${text.slice(0, 200)}`);
     }
-    return resp.json();
+    // Tolerate an empty / non-JSON 2xx body — addEntry/addBreakpoint/end ignore
+    // the response, so a body-less 200/204 must not throw a spurious failure.
+    const text = await resp.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {};
+    }
   }
 
   private async send(
