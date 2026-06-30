@@ -32,9 +32,11 @@ function payload() {
 
 function readBody(req) {
   return new Promise((resolve) => {
-    let data = '';
-    req.on('data', (chunk) => (data += chunk));
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('error', () => resolve({}));
     req.on('end', () => {
+      const data = Buffer.concat(chunks).toString('utf8');
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch {

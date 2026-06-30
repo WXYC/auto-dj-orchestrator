@@ -11,6 +11,9 @@ type Heartbeat = Extract<InboundMessage, { type: 'heartbeat' }>;
 
 export class DeviceStatusStore implements DeviceStatusProvider {
   private last: { heartbeat: Heartbeat; atMs: number } | null = null;
+  // Last RELAY state the device actually reported. Tracked separately so a
+  // heartbeat that omits the optional field doesn't flip the displayed state.
+  private lastRelayAutoDjActive: boolean | undefined;
 
   constructor(
     private readonly offlineThresholdMs: number,
@@ -19,6 +22,9 @@ export class DeviceStatusStore implements DeviceStatusProvider {
 
   update(heartbeat: Heartbeat): void {
     this.last = { heartbeat, atMs: this.now() };
+    if (heartbeat.relay_auto_dj_active !== undefined) {
+      this.lastRelayAutoDjActive = heartbeat.relay_auto_dj_active;
+    }
   }
 
   summary(): AutoDJDeviceSummary | null {
@@ -28,8 +34,9 @@ export class DeviceStatusStore implements DeviceStatusProvider {
       online,
       transport: this.last.heartbeat.transport,
       lastHeartbeat: new Date(this.last.atMs).toISOString(),
-      // relay_auto_dj_active === true => no live DJ => "auto_dj_active"
-      relayState: this.last.heartbeat.relay_auto_dj_active === false ? 'dj_live' : 'auto_dj_active',
+      // relay_auto_dj_active === false => live DJ => "dj_live"; true or
+      // never-reported => "auto_dj_active" (the relay's at-rest state).
+      relayState: this.lastRelayAutoDjActive === false ? 'dj_live' : 'auto_dj_active',
     };
   }
 }
