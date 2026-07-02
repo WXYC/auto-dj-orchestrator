@@ -3,7 +3,7 @@
  * `CommandQueue` implements `ArduinoCommandSink` and `DeviceStatusStore`
  * implements `DeviceStatusProvider` (src/management/).
  */
-import type { AutoDJCommandAction, AutoDJDeviceSummary } from './contracts.js';
+import type { AutoDJCommandAction, AutoDJDeviceSummary } from '@wxyc/shared/auto-dj';
 
 /** Sink for commands the orchestrator dispatches to the Arduino (pause/resume/...). */
 export interface ArduinoCommandSink {

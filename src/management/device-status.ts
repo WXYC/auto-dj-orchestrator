@@ -3,7 +3,7 @@
  * status response. Implements DeviceStatusProvider so the coordinator can read
  * it without depending on the management channel directly.
  */
-import type { AutoDJDeviceSummary } from '../contracts.js';
+import type { AutoDJDeviceSummary } from '@wxyc/shared/auto-dj';
 import type { DeviceStatusProvider } from '../ports.js';
 import type { InboundMessage } from './codec.js';
 

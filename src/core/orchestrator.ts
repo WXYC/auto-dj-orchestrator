@@ -6,7 +6,7 @@
  * that themselves dispatch (START_SHOW -> SHOW_STARTED) run inline within the
  * same serialized unit, avoiding deadlock.
  */
-import type { AutoDJDeactivateResponse, AutoDJStatus } from '../contracts.js';
+import type { AutoDJDeactivateResponse, AutoDJStatus } from '@wxyc/shared/auto-dj';
 import type { Logger } from '../logger.js';
 import type { ArduinoCommandSink, DeviceStatusProvider } from '../ports.js';
 import type { FlowsheetClient } from '../backend/flowsheet-client.js';

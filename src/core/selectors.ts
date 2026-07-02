@@ -7,7 +7,7 @@ import type {
   AutoDJDeactivateResponse,
   AutoDJDeviceSummary,
   AutoDJStatus,
-} from '../contracts.js';
+} from '@wxyc/shared/auto-dj';
 import { isActive, type Activation, type ActivationState } from './state.js';
 
 function toSource(a: Activation): AutoDJActivationSource {

@@ -68,4 +68,6 @@ The Arduino-facing channel. `ws-server.ts` hosts a WebSocket at `/api/auto-dj/ws
 
 ## Shared types
 
-Wire contracts are vendored in `src/contracts.ts` (a copy of the `@wxyc/shared/auto-dj` surface) until that package publishes — then swap the import and delete the file. See WXYC/wxyc-shared#203.
+Wire contracts come from `@wxyc/shared/auto-dj` (generated from `components/schemas` in wxyc-shared `api.yaml`). `codec.ts` carries a compile-time tie (`_AssertInboundMatchesContract`) that fails the build if the zod validators drift from the published types — with one documented exception: `AutoDJErrorReport.code` is validated as a free string (the contract's closed `AutoDJErrorCode` enum widened) so a version-skew firmware code is logged, not dropped.
+
+`@wxyc/shared` declares `better-auth` as an _optional_ peer, but GitHub Packages strips `peerDependenciesMeta` from its packument, so npm's resolver still treats it as a hard peer and tries to auto-install it — pulling `@tanstack/react-start → vite >=7`, which collides with `vitest`'s vite 5. `.npmrc` sets `legacy-peer-deps=true` to skip peer auto-install; better-auth is auth-client-only and never enters this type-only consumer's tree (verify with `ls node_modules/better-auth` → absent).

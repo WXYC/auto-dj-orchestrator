@@ -4,7 +4,7 @@
  * malformed/unknown frames parse to null and are dropped.
  */
 import { z } from 'zod';
-import type { AutoDJWebSocketMessage } from '../contracts.js';
+import type { AutoDJErrorReport, AutoDJWebSocketMessage } from '@wxyc/shared/auto-dj';
 
 const stateEnum = z.enum(['BOOTING', 'CONNECTING', 'CONNECTED', 'ERROR_STATE']);
 
@@ -60,11 +60,18 @@ const inbound = z.discriminatedUnion('type', [heartbeat, ack, buttonToggle, erro
 
 export type InboundMessage = z.infer<typeof inbound>;
 
-// Compile-time tie to the wire contract: every inbound variant must be assignable
-// to AutoDJWebSocketMessage, so a future contract change (e.g. when
-// @wxyc/shared/auto-dj lands) that these zod schemas don't track fails the build
-// instead of silently dropping real Arduino frames at runtime.
-type _AssertInboundMatchesContract = InboundMessage extends AutoDJWebSocketMessage ? true : never;
+// Compile-time tie to the wire contract (@wxyc/shared/auto-dj): every inbound
+// variant must be assignable to AutoDJWebSocketMessage, so a future contract
+// change these zod schemas don't track fails the build instead of silently
+// dropping real Arduino frames at runtime. The one deliberate exception is
+// AutoDJErrorReport.code: the contract types it as the closed AutoDJErrorCode
+// enum, but we validate it as a free string so a version-skew code from the
+// firmware is logged rather than dropped — an error report is exactly the frame
+// we least want to lose. So we compare against the contract with code widened.
+type InboundContractMessage =
+  | Exclude<AutoDJWebSocketMessage, AutoDJErrorReport>
+  | (Omit<AutoDJErrorReport, 'code'> & { code: string });
+type _AssertInboundMatchesContract = InboundMessage extends InboundContractMessage ? true : never;
 const _inboundContractTie: _AssertInboundMatchesContract = true;
 void _inboundContractTie;
 
