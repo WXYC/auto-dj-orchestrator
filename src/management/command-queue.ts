@@ -4,7 +4,7 @@
  * listener (the WS server pushes immediately); HTTP fallback reads `getPending`
  * and the Arduino acks each by id, which removes it.
  */
-import type { AutoDJCommand, AutoDJCommandAction } from '../contracts.js';
+import type { AutoDJCommand, AutoDJCommandAction } from '@wxyc/shared/auto-dj';
 import type { ArduinoCommandSink } from '../ports.js';
 
 export class CommandQueue implements ArduinoCommandSink {
