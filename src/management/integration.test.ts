@@ -5,7 +5,7 @@
  * relay(live DJ) -> end paths. (The HTTP fallback is covered in
  * src/http/routes/arduino-http.test.ts.)
  */
-import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import express from 'express';
@@ -206,6 +206,65 @@ describe('management channel integration', () => {
     );
     await waitFor(() => bs.calls.end.length === 1);
     expect(orchestrator.getStatus().active).toBe(false);
+    ws.close();
+  });
+});
+
+/**
+ * The message handler is `void this.onMessage(...).catch(...)`. onMessage awaits
+ * orchestrator dispatches; a rejecting dispatch would otherwise surface as an
+ * unhandled rejection and terminate the process under Node's default policy.
+ * This drives a rejecting dispatch and asserts it is caught + logged (proof the
+ * handler survived), not left to crash.
+ */
+describe('management channel unhandled-rejection safety', () => {
+  let server: Server;
+  let wsServer: ManagementWsServer;
+  let port: number;
+  let errorSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    errorSpy = vi.fn();
+    const logger = { info() {}, warn() {}, error: errorSpy, debug() {} } as never;
+    // A fake orchestrator whose dispatch rejects (e.g. reduce/save throwing).
+    const orchestrator = {
+      buttonToggled: () => Promise.reject(new Error('dispatch boom')),
+      relayState: () => Promise.reject(new Error('dispatch boom')),
+      getStatus: () => ({ active: false }),
+    } as unknown as Orchestrator;
+    wsServer = new ManagementWsServer({
+      authKey: AUTH_KEY,
+      orchestrator,
+      deviceStore: new DeviceStatusStore(60_000),
+      commandQueue: new CommandQueue(),
+      pingIntervalMs: 100_000,
+      logger,
+    });
+    server = createServer();
+    wsServer.attach(server);
+    await new Promise<void>((r) => server.listen(0, r));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterEach(async () => {
+    wsServer.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('catches and logs a rejecting dispatch instead of crashing', async () => {
+    const ws = new WebSocket(`ws://localhost:${port}/api/auto-dj/ws`, {
+      headers: { 'x-auto-dj-key': AUTH_KEY },
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', reject);
+    });
+    ws.send(JSON.stringify({ type: 'button_toggle', timestamp: 1 }));
+    // The .catch() logs this exact message; without it the rejection is unhandled.
+    await waitFor(() =>
+      errorSpy.mock.calls.some((c) => c[1] === 'management message handler failed'),
+    );
+    expect(errorSpy).toHaveBeenCalled();
     ws.close();
   });
 });
