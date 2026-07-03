@@ -31,7 +31,13 @@ export type Event =
   | { kind: 'SHOW_ENDED' }
   | { kind: 'HOUR_TICK'; epochHour: number }
   | { kind: 'BREAKPOINT_POSTED'; epochHour: number }
-  | { kind: 'RECOVERED'; showId: number; activatedBy: Activation; epochHour: number };
+  | {
+      kind: 'RECOVERED';
+      showId: number;
+      activatedBy: Activation;
+      epochHour: number;
+      lastPostedShId?: number;
+    };
 
 export type Effect =
   | { type: 'START_SHOW' }
@@ -61,18 +67,26 @@ const reject = (state: ActivationState, rejection: RejectionCode): ReduceResult 
 // keeps the live-DJ (is_live) signal current even while auto-DJ is inactive, so
 // `liveDj` can clear when a live DJ leaves.
 
+// PERSIST_STATE comes FIRST so the transitional intent (ACTIVATING / DEACTIVATING)
+// is durable before the killable network call: SHOW_STARTED / SHOW_ENDED overwrite
+// it with the terminal phase on success, but a crash in between leaves the
+// transitional phase on disk for recover() to clean up (an orphaned show start, or
+// an interrupted teardown). With PERSIST last, only {ACTIVE, INACTIVE} ever reached
+// disk, so a crash mid-deactivate re-attached (resurrected) the show and a crash
+// mid-activate left an orphan BS show that recovery never probed.
+
 /** Effects emitted when auto-DJ turns on. */
 const ACTIVATE_EFFECTS: Effect[] = [
+  { type: 'PERSIST_STATE' },
   { type: 'START_SHOW' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'resume' },
-  { type: 'PERSIST_STATE' },
 ];
 
 /** Effects emitted when auto-DJ turns off. */
 const DEACTIVATE_EFFECTS: Effect[] = [
+  { type: 'PERSIST_STATE' },
   { type: 'END_SHOW' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'pause' },
-  { type: 'PERSIST_STATE' },
 ];
 
 function activate(state: ActivationState, activatedBy: Activation): ReduceResult {
@@ -152,9 +166,12 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
         if (state.lastPostedShId === event.track.shId) {
           return { state: { ...state, currentTrack: detected }, effects: [] };
         }
+        // Persist the advanced lastPostedShId (via the trailing PERSIST_STATE) so
+        // a restart mid-show doesn't re-post the still-playing track — the
+        // snapshot carries the dedupe key across the restart.
         return {
           state: { ...state, currentTrack: detected, lastPostedShId: event.track.shId },
-          effects: [{ type: 'POST_ENTRY', track: event.track }],
+          effects: [{ type: 'POST_ENTRY', track: event.track }, { type: 'PERSIST_STATE' }],
         };
       }
       if (state.phase === 'ACTIVATING') {
@@ -222,7 +239,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           activatedBy: event.activatedBy,
           lastBreakpointHour: event.epochHour,
           currentTrack: null,
-          lastPostedShId: undefined,
+          lastPostedShId: event.lastPostedShId,
         },
         effects: [{ type: 'PERSIST_STATE' }],
       };
