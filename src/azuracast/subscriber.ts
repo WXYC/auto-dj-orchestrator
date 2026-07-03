@@ -40,6 +40,7 @@ export class AzuraCastSubscriber implements AzuraCastSource {
   private centrifuge: Centrifuge | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private connected = false;
+  private running = false;
   private lastShId = 0;
   private lastIsLive: boolean | null = null;
   private latest: NowPlaying | null = null;
@@ -55,11 +56,13 @@ export class AzuraCastSubscriber implements AzuraCastSource {
     // Idempotent: a second start() without an intervening stop() would orphan
     // the prior poll timer and open a duplicate Centrifuge connection.
     if (this.pollTimer || this.centrifuge) return;
+    this.running = true;
     this.connectCentrifuge();
     this.schedulePoll();
   }
 
   stop(): void {
+    this.running = false;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
     this.centrifuge?.disconnect();
@@ -73,6 +76,16 @@ export class AzuraCastSubscriber implements AzuraCastSource {
 
   current(): NowPlaying | null {
     return this.latest;
+  }
+
+  /**
+   * Ingest only while running. A poll fetch or a Centrifugo publication can
+   * resolve after stop() (the in-flight fetch isn't aborted); since stop() resets
+   * the dedupe state, a late ingest would otherwise re-fire onTrack/onLive into a
+   * shutting-down orchestrator. `ingest` itself stays unguarded for direct reuse.
+   */
+  private ingestIfRunning(payload: unknown): void {
+    if (this.running) this.ingest(payload);
   }
 
   /** Feed a raw AzuraCast/Centrifugo payload through dedupe and emit events. */
@@ -102,7 +115,7 @@ export class AzuraCastSubscriber implements AzuraCastSource {
       const sub = centrifuge.newSubscription(`station:${this.opts.stationShortcode}`, {
         recoverable: true,
       });
-      sub.on('publication', (ctx) => this.ingest(ctx.data));
+      sub.on('publication', (ctx) => this.ingestIfRunning(ctx.data));
       centrifuge.on('connected', () => {
         this.connected = true;
         this.opts.logger?.info('azuracast centrifugo connected');
@@ -131,7 +144,7 @@ export class AzuraCastSubscriber implements AzuraCastSource {
       this.pollTimer = setTimeout(tick, interval);
       try {
         const resp = await this.fetchFn(this.opts.httpUrl);
-        if (resp.ok) this.ingest(await resp.json());
+        if (resp.ok) this.ingestIfRunning(await resp.json());
       } catch (err) {
         this.opts.logger?.debug({ err }, 'azuracast poll failed');
       }

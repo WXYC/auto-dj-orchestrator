@@ -37,8 +37,11 @@ function cors(allowed: string[]): RequestHandler {
 
 export function createApp(deps: ServerDeps): Express {
   const app = express();
-  app.use(express.json());
+  // CORS before body parsing: a malformed-JSON 400 thrown by express.json() must
+  // still carry Access-Control-Allow-Origin, or the browser surfaces a CORS error
+  // instead of the real status (there is no custom error handler to re-add them).
   app.use(cors(deps.corsAllowedOrigins));
+  app.use(express.json());
 
   app.get('/healthcheck', (_req, res) => {
     const status = deps.orchestrator.getStatus();
