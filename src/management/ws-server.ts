@@ -77,14 +77,21 @@ export class ManagementWsServer {
     ws.isAlive = true;
     this.deps.logger.info('arduino connected to management channel');
     ws.on('pong', () => (ws.isAlive = true));
-    ws.on('message', (data: Buffer) => void this.onMessage(ws, data.toString()));
+    // onMessage is async and awaits orchestrator dispatches that can reject;
+    // catch here so a rejection doesn't become an unhandled rejection (which on
+    // Node's default policy terminates the process).
+    ws.on('message', (data: Buffer) => {
+      void this.onMessage(ws, data.toString()).catch((err) =>
+        this.deps.logger.error({ err }, 'management message handler failed'),
+      );
+    });
     ws.on('close', () => {
       this.sockets.delete(ws);
       this.deps.logger.warn('arduino disconnected from management channel');
     });
     ws.on('error', (err) => this.deps.logger.warn({ err }, 'management ws error'));
     // Flush any commands queued before the device connected.
-    for (const command of this.deps.commandQueue.getPending()) ws.send(serialize(command));
+    for (const command of this.deps.commandQueue.getPending()) this.sendTo(ws, serialize(command));
   }
 
   private async onMessage(ws: TrackedSocket, raw: string): Promise<void> {
@@ -104,7 +111,8 @@ export class ManagementWsServer {
       case 'button_toggle': {
         await this.deps.orchestrator.buttonToggled();
         const active = this.deps.orchestrator.getStatus().active;
-        ws.send(
+        this.sendTo(
+          ws,
           serialize({ type: 'ack', id: `btn_${msg.timestamp}`, status: 'ok', result: { active } }),
         );
         break;
@@ -121,10 +129,13 @@ export class ManagementWsServer {
     }
   }
 
+  /** Write to a socket only when it is open (a closing/closed send is a silent no-op). */
+  private sendTo(ws: TrackedSocket, payload: string): void {
+    if (ws.readyState === ws.OPEN) ws.send(payload);
+  }
+
   private broadcast(payload: string): void {
-    for (const ws of this.sockets) {
-      if (ws.readyState === ws.OPEN) ws.send(payload);
-    }
+    for (const ws of this.sockets) this.sendTo(ws, payload);
   }
 
   private pingAll(): void {
@@ -135,7 +146,7 @@ export class ManagementWsServer {
         continue;
       }
       ws.isAlive = false;
-      ws.ping();
+      if (ws.readyState === ws.OPEN) ws.ping();
     }
   }
 }
