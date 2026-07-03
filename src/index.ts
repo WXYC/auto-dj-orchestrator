@@ -57,8 +57,10 @@ async function main(): Promise<void> {
       logger,
     },
     {
-      onTrack: (track) => void orchestrator.onTrack(track),
-      onLive: (isLive) => void orchestrator.onLive(isLive),
+      onTrack: (track) =>
+        void orchestrator.onTrack(track).catch((err) => logger.error({ err }, 'onTrack failed')),
+      onLive: (isLive) =>
+        void orchestrator.onLive(isLive).catch((err) => logger.error({ err }, 'onLive failed')),
     },
   );
 
@@ -108,7 +110,10 @@ async function main(): Promise<void> {
     logger.info({ port: config.ORCHESTRATOR_PORT }, 'auto-dj-orchestrator listening');
   });
 
+  let shuttingDown = false;
   const shutdown = (signal: string) => {
+    if (shuttingDown) return; // a second signal (SIGTERM then SIGINT) is a no-op
+    shuttingDown = true;
     logger.info({ signal }, 'shutting down (show is left running for recovery)');
     orchestrator.stop();
     wsServer.close();

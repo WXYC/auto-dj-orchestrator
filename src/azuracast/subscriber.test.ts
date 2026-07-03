@@ -81,3 +81,32 @@ describe('AzuraCastSubscriber.ingest', () => {
     // The second pair is live-then-track: deactivate is enqueued before the entry post.
   });
 });
+
+describe('AzuraCastSubscriber stop() during an in-flight poll', () => {
+  it('drops a poll response that resolves after stop() (no emit into a stopped subscriber)', async () => {
+    let resolveFetch: (v: unknown) => void = () => {};
+    const fetchFn = vi.fn(
+      () => new Promise((resolve) => (resolveFetch = resolve as (v: unknown) => void)),
+    ) as unknown as typeof fetch;
+    const tracks: NowPlaying[] = [];
+    const live: boolean[] = [];
+    const sub = new AzuraCastSubscriber(
+      {
+        wsUrl: 'ws://127.0.0.1:1', // refused -> polling only
+        httpUrl: 'https://example/np.json',
+        stationShortcode: 'wxyc',
+        safetyPollMs: 1000,
+        fallbackPollMs: 1000,
+        fetchFn,
+      },
+      { onTrack: (t) => tracks.push(t), onLive: (l) => live.push(l) },
+    );
+    sub.start();
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
+    sub.stop(); // stop while the poll fetch is still in flight
+    resolveFetch({ ok: true, json: async () => payload(5, true) });
+    await new Promise((r) => setTimeout(r, 10)); // let the awaited continuation run
+    expect(tracks).toEqual([]); // stopped: the late response is dropped
+    expect(live).toEqual([]);
+  });
+});
