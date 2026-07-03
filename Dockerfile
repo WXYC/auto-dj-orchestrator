@@ -11,7 +11,7 @@
 FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json .npmrc ./
-RUN --mount=type=secret,id=NPM_TOKEN \
+RUN --mount=type=secret,id=NPM_TOKEN,required=true \
     NPM_TOKEN="$(cat /run/secrets/NPM_TOKEN)" npm ci
 
 FROM node:24-alpine AS build
@@ -25,7 +25,7 @@ FROM node:24-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json .npmrc ./
-RUN --mount=type=secret,id=NPM_TOKEN \
+RUN --mount=type=secret,id=NPM_TOKEN,required=true \
     NPM_TOKEN="$(cat /run/secrets/NPM_TOKEN)" npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 EXPOSE 8090
