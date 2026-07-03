@@ -32,4 +32,16 @@ describe('CommandQueue', () => {
     expect(q.pendingCount).toBe(1);
     expect(q.getPending()[0].action).toBe('resume'); // last write wins
   });
+
+  it('collapse is scoped to power commands: an interleaved non-power command survives', () => {
+    const q = new CommandQueue();
+    q.send('pause'); // cmd_1 (power)
+    q.send('end_show'); // cmd_2 (non-power, non-idempotent — must never be dropped)
+    q.send('resume'); // cmd_3 (power) supersedes cmd_1 only
+    // pause collapsed; end_show preserved (an unscoped collapse would lose it).
+    expect(q.getPending().map((c) => ({ id: c.id, action: c.action }))).toEqual([
+      { id: 'cmd_2', action: 'end_show' },
+      { id: 'cmd_3', action: 'resume' },
+    ]);
+  });
 });
