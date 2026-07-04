@@ -67,14 +67,6 @@ describe('StateStore', () => {
       expect(entries).toEqual(['state.json']); // temp sibling was renamed away, not left
     });
 
-    it('uses the documented .<name>.tmp temp path', async () => {
-      // The comment guarantees a fixed temp name (safe because saves are
-      // serialized). Assert the derivation so a rename to a colliding real path
-      // can't silently regress.
-      const tmp = join(dirname(path), `.${basename(path)}.tmp`);
-      expect(basename(tmp)).toBe('.state.json.tmp');
-    });
-
     it('never truncates a previously-valid snapshot when a later save fails mid-write', async () => {
       const store = new StateStore(path);
       await store.save(snapshot); // a good snapshot is on disk
