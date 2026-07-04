@@ -53,7 +53,7 @@ All env vars are documented in `.env.example` and validated by `src/config.ts` a
 
 ## Testing
 
-TDD, pure modules first. `npm test` runs the unit suites (reducer, conflict/breakpoint, parse, map-track, token-manager incl. the refresh-race case, jwks-verifier, codec, device-status, command-queue) plus integration: the coordinator with fakes; a real `ws` "Arduino" client driving the real WS server + orchestrator into a mocked Backend-Service (button → join → ack(`result.active`); relay live-DJ → end); and a real `AzuraCastSubscriber` polling a drivable now-playing server through to a flowsheet entry.
+TDD, pure modules first. `npm test` runs the unit suites (reducer, conflict/breakpoint, parse, map-track, token-manager incl. the refresh-race case, jwks-verifier, codec, device-status, command-queue, state-store incl. the atomic-write and corrupt-snapshot cases) plus integration: the coordinator with fakes; a real `ws` "Arduino" client driving the real WS server + orchestrator into a mocked Backend-Service (button → join → ack(`result.active`); relay live-DJ → end); and a real `AzuraCastSubscriber` polling a drivable now-playing server through to a flowsheet entry.
 
 ## Management channel (`src/management/`)
 

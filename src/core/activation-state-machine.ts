@@ -30,6 +30,7 @@ export type Event =
   | { kind: 'SHOW_STARTED'; showId: number; epochHour: number }
   | { kind: 'SHOW_ENDED' }
   | { kind: 'HOUR_TICK'; epochHour: number }
+  | { kind: 'ENTRY_POSTED'; shId: number }
   | { kind: 'BREAKPOINT_POSTED'; epochHour: number }
   | {
       kind: 'RECOVERED';
@@ -166,12 +167,15 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
         if (state.lastPostedShId === event.track.shId) {
           return { state: { ...state, currentTrack: detected }, effects: [] };
         }
-        // Persist the advanced lastPostedShId (via the trailing PERSIST_STATE) so
-        // a restart mid-show doesn't re-post the still-playing track — the
-        // snapshot carries the dedupe key across the restart.
+        // Advance lastPostedShId in memory now so a same-sh_id callback that
+        // races in during the post is deduped, but do NOT persist here: the
+        // snapshot's dedupe key must only ever record a track that BS actually
+        // accepted. If addEntry() fails, PERSIST is skipped (see ENTRY_POSTED),
+        // so a restart re-attempts the entry instead of the snapshot claiming a
+        // never-posted track as already posted and dropping it forever.
         return {
           state: { ...state, currentTrack: detected, lastPostedShId: event.track.shId },
-          effects: [{ type: 'POST_ENTRY', track: event.track }, { type: 'PERSIST_STATE' }],
+          effects: [{ type: 'POST_ENTRY', track: event.track }],
         };
       }
       if (state.phase === 'ACTIVATING') {
@@ -218,6 +222,20 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
       // (BREAKPOINT_POSTED). A transient failure then retries on the next tick
       // instead of permanently skipping the hour.
       return { state, effects: [{ type: 'POST_BREAKPOINT', epochHour: event.epochHour }] };
+    }
+
+    case 'ENTRY_POSTED': {
+      // The coordinator dispatches this only after flowsheet.addEntry() succeeds.
+      // NOW_PLAYING already advanced lastPostedShId in memory (for same-sh_id
+      // dedupe); persisting here — and only here — keeps the durable dedupe key
+      // limited to entries BS actually accepted, so a crashed post is retried
+      // after a restart rather than silently dropped. Persist only if the
+      // confirmed sh_id is still the current dedupe key, so a late confirmation
+      // can't durably record a key the live state has already moved past.
+      if (state.phase !== 'ACTIVE' || state.lastPostedShId !== event.shId) {
+        return { state, effects: [] };
+      }
+      return { state, effects: [{ type: 'PERSIST_STATE' }] };
     }
 
     case 'BREAKPOINT_POSTED': {
