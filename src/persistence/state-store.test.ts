@@ -47,15 +47,13 @@ describe('StateStore', () => {
       expect(logger.error).not.toHaveBeenCalled();
     });
 
-    it('returns null and logs an error (not silently) when the snapshot is corrupt', async () => {
-      const { logger, asLogger } = fakeLogger();
+    it('throws when the snapshot is corrupt (so recovery can probe instead of silently orphaning)', async () => {
       await writeFile(path, '{ this is not: valid json', 'utf8');
-      const store = new StateStore(path, asLogger);
-      expect(await store.load()).toBeNull();
-      // A corrupt snapshot means a show may be on air; it must be surfaced loudly,
-      // not swallowed like a missing file.
-      expect(logger.error).toHaveBeenCalledTimes(1);
-      expect(logger.warn).not.toHaveBeenCalled();
+      const store = new StateStore(path);
+      // A corrupt snapshot means a show may be on air; throwing (vs. the null a
+      // missing file returns) lets recover() probe BS and end any orphan rather
+      // than starting inactive and orphaning it.
+      await expect(store.load()).rejects.toThrow(/corrupt/i);
     });
   });
 
@@ -92,6 +90,31 @@ describe('StateStore', () => {
       const store = new StateStore(join(dir, 'missing-subdir', 'state.json'), asLogger);
       await expect(store.save(snapshot)).resolves.toBeUndefined();
       expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('saveStrict()', () => {
+    it('round-trips a snapshot like save()', async () => {
+      const store = new StateStore(path);
+      await store.saveStrict(snapshot);
+      expect(await store.load()).toEqual(snapshot);
+    });
+
+    it('throws when the write fails, so a gating persist can abort the batch', async () => {
+      // A path whose parent directory does not exist makes writeFile fail (ENOENT).
+      const store = new StateStore(join(dir, 'missing-subdir', 'state.json'));
+      await expect(store.saveStrict(snapshot)).rejects.toThrow();
+    });
+
+    it('does not corrupt the live snapshot when a strict write fails', async () => {
+      const store = new StateStore(path);
+      await store.save(snapshot); // a good snapshot is on disk
+      // Occupy the fixed temp path with a directory so writeFile(tmp) throws EISDIR.
+      const tmp = join(dirname(path), `.${basename(path)}.tmp`);
+      await mkdir(tmp);
+      await expect(store.saveStrict({ ...snapshot, lastPostedShId: 999 })).rejects.toThrow();
+      const onDisk = JSON.parse(await readFile(path, 'utf8')) as Snapshot;
+      expect(onDisk.lastPostedShId).toBe(555); // old value intact, not torn
     });
   });
 });

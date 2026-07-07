@@ -40,16 +40,18 @@ export class StateStore {
       return JSON.parse(raw) as Snapshot;
     } catch (err) {
       // A corrupt snapshot means something WAS persisted but is now unreadable —
-      // a show may be on air. Surface it loudly rather than silently orphaning it.
-      this.logger?.error(
-        { err },
-        'auto-dj state snapshot is corrupt; cannot re-attach a running show on recovery',
-      );
-      return null;
+      // a show may be on air. Throw (rather than returning null, which is
+      // indistinguishable from "no snapshot") so recover() can probe BS and end
+      // any orphan instead of silently starting inactive and orphaning it.
+      throw new Error('auto-dj state snapshot is corrupt', { cause: err });
     }
   }
 
-  async save(snapshot: Snapshot): Promise<void> {
+  /**
+   * Atomically persist a snapshot, throwing on failure. Used to gate a network
+   * call on a durable write (the ACTIVATING intent — see the orchestrator).
+   */
+  async saveStrict(snapshot: Snapshot): Promise<void> {
     // Write to a temp file then atomically rename. rename(2) is atomic within a
     // filesystem, so a crash mid-write can never truncate the live snapshot — a
     // bare writeFile() opens with O_TRUNC and would leave a 0-byte file, which
@@ -61,8 +63,17 @@ export class StateStore {
       await writeFile(tmp, JSON.stringify(snapshot), 'utf8');
       await rename(tmp, this.path);
     } catch (err) {
-      this.logger?.warn({ err }, 'failed to persist auto-dj state snapshot');
       await rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Best-effort persist: a failure is logged, not thrown. */
+  async save(snapshot: Snapshot): Promise<void> {
+    try {
+      await this.saveStrict(snapshot);
+    } catch (err) {
+      this.logger?.warn({ err }, 'failed to persist auto-dj state snapshot');
     }
   }
 }
