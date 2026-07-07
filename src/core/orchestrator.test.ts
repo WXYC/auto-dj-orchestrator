@@ -159,49 +159,6 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // teardown finished
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT re-activated
   });
-
-  it('does not re-post the still-playing track after re-attaching on restart', async () => {
-    const snapshot: Snapshot = {
-      phase: 'ACTIVE',
-      showId: 789,
-      lastBreakpointHour: 100,
-      lastPostedShId: 555, // the track playing (and already posted) before the restart
-    };
-    const h = harness({ snapshot, isOnAir: true });
-    await h.orchestrator.recover();
-    await h.orchestrator.onTrack(track(555)); // subscriber's first poll: same song still playing
-    expect(h.flowsheet.addEntry).not.toHaveBeenCalled(); // dedupe key survived the restart
-    await h.orchestrator.onTrack(track(556)); // a genuinely new track still posts
-    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(556));
-  });
-
-  it('ends an orphaned show and stays inactive when an interrupted activation is recovered', async () => {
-    // Crashed mid-join: ACTIVATING persisted, but the show id was never learned.
-    const snapshot: Snapshot = { phase: 'ACTIVATING' };
-    const h = harness({ snapshot, isOnAir: true }); // BS reports on-air => our join created an orphan
-    await h.orchestrator.recover();
-    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan torn down
-    expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT auto-resurrected
-    expect(h.orchestrator.getStatus().active).toBe(false);
-  });
-
-  it('stays inactive without ending anything when an interrupted activation created no show', async () => {
-    const snapshot: Snapshot = { phase: 'ACTIVATING' };
-    const h = harness({ snapshot, isOnAir: false }); // join never reached BS
-    await h.orchestrator.recover();
-    expect(h.flowsheet.end).not.toHaveBeenCalled();
-    expect(h.orchestrator.getStatus().active).toBe(false);
-  });
-
-  it('persists the transitional phase before the network call so a crash mid-flight is recoverable', async () => {
-    const h = harness();
-    await h.orchestrator.activate({ userId: 'u1' });
-    const activatePhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
-    expect(activatePhases).toContain('ACTIVATING'); // durable before flowsheet.join()
-    await h.orchestrator.deactivate();
-    const deactivatePhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
-    expect(deactivatePhases).toContain('DEACTIVATING'); // durable before flowsheet.end()
-  });
 });
 
 describe('Orchestrator — opening entry + breakpoint retry', () => {

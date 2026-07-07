@@ -34,7 +34,6 @@ const snapshotOf = (s: ActivationState): Snapshot => ({
   showId: s.showId,
   activatedBy: s.activatedBy,
   lastBreakpointHour: s.lastBreakpointHour,
-  lastPostedShId: s.lastPostedShId,
 });
 
 export class Orchestrator {
@@ -103,9 +102,7 @@ export class Orchestrator {
   /** Start the hourly-breakpoint ticker. Idempotent. */
   start(): void {
     if (this.ticker) return;
-    this.ticker = setInterval(() => {
-      void this.hourTick().catch((err) => this.deps.logger.error({ err }, 'hour tick failed'));
-    }, this.deps.tickIntervalMs ?? 60_000);
+    this.ticker = setInterval(() => void this.hourTick(), this.deps.tickIntervalMs ?? 60_000);
   }
 
   stop(): void {
@@ -117,20 +114,7 @@ export class Orchestrator {
   /** Boot recovery: re-attach to an in-progress show only if BS confirms it is on air. */
   async recover(): Promise<void> {
     const snap = await this.deps.stateStore.load();
-    if (!snap) return;
-
-    // ACTIVATING: activation was interrupted before we learned the show id, so
-    // flowsheet.join() may or may not have created a show in BS. Probe and tear
-    // down any orphan, then stay INACTIVE — activation was never confirmed, so we
-    // never auto-resurrect; a human must re-activate.
-    if (snap.phase === 'ACTIVATING') {
-      await this.recoverInterruptedActivation();
-      return;
-    }
-
-    // ACTIVE / DEACTIVATING carry a show id; without one there is nothing to
-    // re-attach to or finish.
-    if (snap.showId === undefined) return;
+    if (!snap || snap.showId === undefined) return;
     if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return;
 
     // Distinguish "definitely off-air" (probe returned false) from "couldn't
@@ -167,8 +151,7 @@ export class Orchestrator {
       return;
     }
 
-    // phase ACTIVE: re-attach to the running show. Restore lastPostedShId so the
-    // subscriber's first poll doesn't re-post the still-playing track.
+    // phase ACTIVE: re-attach to the running show.
     await this.enqueue(() =>
       this.applyEvent({
         kind: 'RECOVERED',
@@ -179,40 +162,9 @@ export class Orchestrator {
           at: this.nowIso(),
         },
         epochHour: epochHour(this.now()),
-        lastPostedShId: snap.lastPostedShId,
       }),
     );
     this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
-  }
-
-  /**
-   * Recover from a snapshot captured mid-activation (before the show id was
-   * known). We can't re-attach — we don't have the id — so probe BS and end any
-   * show the interrupted join() may have created, then stay INACTIVE. Erring
-   * toward end() on an indeterminate probe avoids leaving an orphan on air.
-   */
-  private async recoverInterruptedActivation(): Promise<void> {
-    let onAir = false;
-    let probeFailed = false;
-    try {
-      onAir = await this.deps.flowsheet.isOnAir();
-    } catch (err) {
-      probeFailed = true;
-      this.deps.logger.warn({ err }, 'recovery: interrupted-activation on-air probe failed');
-    }
-    if (!onAir && !probeFailed) {
-      this.deps.logger.info('recovery: interrupted activation created no show; starting inactive');
-      return;
-    }
-    try {
-      await this.deps.flowsheet.end();
-      this.deps.logger.info('recovery: ended an orphaned show from an interrupted activation');
-    } catch (err) {
-      this.deps.logger.warn(
-        { err },
-        'recovery: failed to end orphaned show from interrupted activation',
-      );
-    }
   }
 
   // ── Internals ──────────────────────────────────────────────────────────
