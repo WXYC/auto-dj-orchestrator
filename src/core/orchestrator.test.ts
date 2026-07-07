@@ -42,6 +42,9 @@ function harness(opts?: {
     save: vi.fn(async (s: Snapshot) => {
       saved = s;
     }),
+    saveStrict: vi.fn(async (s: Snapshot) => {
+      saved = s;
+    }),
   };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const orchestrator = new Orchestrator({
@@ -220,11 +223,76 @@ describe('Orchestrator — restart recovery', () => {
   it('persists the transitional phase before the network call so a crash mid-flight is recoverable', async () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1' });
-    const activatePhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
-    expect(activatePhases).toContain('ACTIVATING'); // durable before flowsheet.join()
+    // ACTIVATING is persisted via the strict (gating) save before flowsheet.join().
+    const activatePhases = h.stateStore.saveStrict.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(activatePhases).toContain('ACTIVATING');
     await h.orchestrator.deactivate();
     const deactivatePhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
     expect(deactivatePhases).toContain('DEACTIVATING'); // durable before flowsheet.end()
+  });
+
+  const lastSavedPhase = (h: ReturnType<typeof harness>) =>
+    (h.stateStore.save.mock.calls.at(-1)?.[0] as Snapshot | undefined)?.phase;
+
+  it('ends an orphan and settles inactive when the snapshot is corrupt (a show may be on air)', async () => {
+    const h = harness({ isOnAir: true });
+    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // corrupt != "no snapshot": probe + end
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).toBe('INACTIVE'); // converged
+  });
+
+  it('settles inactive without ending anything when a corrupt snapshot has no show on air', async () => {
+    const h = harness({ isOnAir: false });
+    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
+  });
+
+  it('does not end blind when an interrupted-activation probe is indeterminate (no show id known)', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' } });
+    h.flowsheet.isOnAir.mockRejectedValueOnce(new Error('transient BS error'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).not.toHaveBeenCalled(); // ending blind could hit a human DJ's show
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
+  });
+
+  it('pauses the relay and settles inactive when finishing an interrupted deactivation', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay was left in 'resume'
+    expect(lastSavedPhase(h)).toBe('INACTIVE'); // converged
+  });
+
+  it('recovery is terminal: a second recover() after an interrupted deactivation does not re-end', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    await h.orchestrator.recover(); // snapshot is now INACTIVE; must be a no-op
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // not re-ended every boot
+  });
+
+  it('interrupted-activation recovery settles inactive so a second recover() does not re-end', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // idempotent-terminal
+  });
+
+  it('does not create a BS show when the activation-intent persist fails', async () => {
+    const h = harness();
+    h.stateStore.saveStrict.mockRejectedValueOnce(new Error('disk full'));
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.flowsheet.join).not.toHaveBeenCalled(); // gated: no durable intent -> no join
+    expect(h.orchestrator.getStatus().active).toBe(false); // rolled back
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
 });
 
