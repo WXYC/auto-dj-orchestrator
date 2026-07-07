@@ -55,6 +55,14 @@ describe('StateStore', () => {
       // than starting inactive and orphaning it.
       await expect(store.load()).rejects.toThrow(/corrupt/i);
     });
+
+    it('throws when the snapshot exists but cannot be read (not ENOENT), so recovery still probes', async () => {
+      // A directory at the snapshot path makes readFile throw EISDIR — a non-ENOENT
+      // read error, the same "persisted but unreadable" condition as corrupt JSON.
+      await mkdir(path);
+      const store = new StateStore(path);
+      await expect(store.load()).rejects.toThrow(/unreadable/i);
+    });
   });
 
   describe('save()', () => {

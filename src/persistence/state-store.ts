@@ -29,12 +29,13 @@ export class StateStore {
     try {
       raw = await readFile(this.path, 'utf8');
     } catch (err) {
-      // ENOENT is normal (first boot, or after a clean deactivate). Anything else
-      // is worth surfacing, though there is still nothing to recover from here.
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        this.logger?.warn({ err }, 'failed to read auto-dj state snapshot');
-      }
-      return null;
+      // ENOENT is normal (first boot, or after a clean deactivate) -> null.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      // Any other read error (EACCES from a perms/owner change, EIO from a disk
+      // fault, EISDIR) means a snapshot exists but is unreadable — a show may be on
+      // air. Throw, like the corrupt-JSON case, so recover() probes BS and ends any
+      // orphan rather than mistaking this for "no snapshot" and orphaning a live show.
+      throw new Error('auto-dj state snapshot is unreadable', { cause: err });
     }
     try {
       return JSON.parse(raw) as Snapshot;
