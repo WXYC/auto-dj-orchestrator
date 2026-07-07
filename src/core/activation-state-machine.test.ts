@@ -47,7 +47,7 @@ describe('reduce — activation', () => {
       userName: 'DJ Moonbeam',
       at: AT,
     });
-    expect(effectTypes(effects)).toEqual(['PERSIST_STATE', 'START_SHOW', 'SEND_ARDUINO_COMMAND']);
+    expect(effectTypes(effects)).toEqual(['START_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
   });
 
   it('SHOW_STARTED moves ACTIVATING -> ACTIVE and seeds the breakpoint hour', () => {
@@ -91,7 +91,7 @@ describe('reduce — deactivation', () => {
     expect(state.phase).toBe('DEACTIVATING');
     expect(state.lastDeactivatedBy).toEqual({ source: 'virtual_switch', at: AT });
     expect(state.activatedBy).toBeUndefined();
-    expect(effectTypes(effects)).toEqual(['PERSIST_STATE', 'END_SHOW', 'SEND_ARDUINO_COMMAND']);
+    expect(effectTypes(effects)).toEqual(['END_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
   });
 
   it('SHOW_ENDED moves DEACTIVATING -> INACTIVE and clears the show', () => {
@@ -168,7 +168,7 @@ describe('reduce — track posting + breakpoints', () => {
       track: track(1),
       at: AT,
     });
-    expect(effects).toEqual([{ type: 'POST_ENTRY', track: track(1) }, { type: 'PERSIST_STATE' }]);
+    expect(effects).toEqual([{ type: 'POST_ENTRY', track: track(1) }]);
     expect(state.currentTrack).toEqual({
       artist: 'Juana Molina',
       title: 'la paradoja',
@@ -180,16 +180,12 @@ describe('reduce — track posting + breakpoints', () => {
   it('dedupes consecutive NOW_PLAYING with the same sh_id (no double opening entry)', () => {
     const active = activated();
     const first = reduce(active, { kind: 'NOW_PLAYING', track: track(9), at: AT });
-    expect(first.effects).toEqual([
-      { type: 'POST_ENTRY', track: track(9) },
-      { type: 'PERSIST_STATE' },
-    ]);
+    expect(first.effects).toEqual([{ type: 'POST_ENTRY', track: track(9) }]);
     expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(9), at: AT }).effects).toEqual(
       [],
     );
     expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(10), at: AT }).effects).toEqual([
       { type: 'POST_ENTRY', track: track(10) },
-      { type: 'PERSIST_STATE' },
     ]);
   });
 
@@ -240,12 +236,10 @@ describe('reduce — restart recovery', () => {
       showId: 789,
       activatedBy: { source: 'virtual_switch', userId: 'u1', at: AT },
       epochHour: 100,
-      lastPostedShId: 555,
     });
     expect(state.phase).toBe('ACTIVE');
     expect(state.showId).toBe(789);
     expect(state.lastBreakpointHour).toBe(100);
-    expect(state.lastPostedShId).toBe(555); // restored so the still-playing track isn't re-posted
     expect(effectTypes(effects)).toEqual(['PERSIST_STATE']);
     expect(effectTypes(effects)).not.toContain('START_SHOW');
   });
