@@ -52,6 +52,19 @@ export function virtualSwitchRouter(deps: {
       res.status(409).json({ error: 'Auto-DJ is not currently active' });
       return;
     }
+    // Symmetric with /activate: the reducer accepted the request, but the BS
+    // flowsheet.end() teardown may have failed, leaving the show live on the
+    // flowsheet. The machine still converges to INACTIVE (so getStatus().active
+    // can't reveal this — see #15), so we key off the teardown outcome the
+    // orchestrator reports. Answer 502 rather than a 200 that would tell dj-site
+    // the switch is off while auto-DJ keeps playing. Deliberately omit `status`:
+    // it reports active:false, which would contradict "may still be live."
+    if (result.failedEffect === 'END_SHOW') {
+      res.status(502).json({
+        error: 'Deactivation failed (backend unavailable); the flowsheet show may still be live',
+      });
+      return;
+    }
     res.status(200).json(orchestrator.getDeactivateResponse());
   });
 
