@@ -27,7 +27,7 @@ COPY package.json package-lock.json .npmrc ./
 ARG NPM_TOKEN
 RUN --mount=type=secret,id=NPM_TOKEN \
     TOKEN="$(cat /run/secrets/NPM_TOKEN 2>/dev/null)"; \
-    [ -n "$TOKEN" ] || TOKEN="$NPM_TOKEN"; \
+    [ -n "$TOKEN" ] || TOKEN="$(printf '%s' "$NPM_TOKEN")"; \
     [ -n "$TOKEN" ] || { echo 'NPM_TOKEN not provided: pass a BuildKit --secret or a build ARG'; exit 1; }; \
     NPM_TOKEN="$TOKEN" npm ci
 
