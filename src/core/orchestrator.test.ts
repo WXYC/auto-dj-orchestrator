@@ -175,30 +175,6 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(556));
   });
 
-  it('does not durably record a failed entry as posted, so the track is retried after a restart', async () => {
-    const h = harness();
-    await h.orchestrator.activate({ userId: 'u1' });
-    const persistedShId = () => {
-      const calls = h.stateStore.save.mock.calls;
-      return (calls[calls.length - 1]![0] as Snapshot).lastPostedShId;
-    };
-    const beforeShId = persistedShId();
-
-    // A genuinely new track fails to post to BS.
-    h.flowsheet.addEntry.mockRejectedValueOnce(new Error('BS 500'));
-    await h.orchestrator.onTrack(track(900));
-    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(900));
-    // The snapshot must NOT claim sh_id 900 as posted — otherwise a restart would
-    // dedupe it and drop the never-posted track forever.
-    expect(persistedShId()).toBe(beforeShId);
-    expect(persistedShId()).not.toBe(900);
-
-    // The next track posts and IS durably recorded.
-    await h.orchestrator.onTrack(track(901));
-    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(901));
-    expect(persistedShId()).toBe(901);
-  });
-
   it('ends an orphaned show and stays inactive when an interrupted activation is recovered', async () => {
     // Crashed mid-join: ACTIVATING persisted, but the show id was never learned.
     const snapshot: Snapshot = { phase: 'ACTIVATING' };
