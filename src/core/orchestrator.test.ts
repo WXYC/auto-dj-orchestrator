@@ -136,7 +136,6 @@ describe('Orchestrator — restart recovery', () => {
     expect(status.active).toBe(true);
     expect(status.showId).toBe(789);
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // no duplicate join
-    expect(h.arduino.send).toHaveBeenCalledWith('resume'); // relay re-asserted on re-attach
   });
 
   it('stays inactive when the snapshot is active but BS reports off-air', async () => {
@@ -255,44 +254,13 @@ describe('Orchestrator — restart recovery', () => {
     expect(lastSavedPhase(h)).toBe('INACTIVE');
   });
 
-  it('does not end blind or converge when an interrupted-activation probe is indeterminate', async () => {
+  it('does not end blind when an interrupted-activation probe is indeterminate (no show id known)', async () => {
     const h = harness({ snapshot: { phase: 'ACTIVATING' } });
-    h.flowsheet.isOnAir.mockRejectedValue(new Error('transient BS error')); // stays down
+    h.flowsheet.isOnAir.mockRejectedValueOnce(new Error('transient BS error'));
     await h.orchestrator.recover();
     expect(h.flowsheet.end).not.toHaveBeenCalled(); // ending blind could hit a human DJ's show
     expect(h.orchestrator.getStatus().active).toBe(false);
-    // Must NOT persist INACTIVE — that would abandon a possible orphan and stop the
-    // next boot from re-probing. The ACTIVATING snapshot is left for retry.
-    expect(h.stateStore.save).not.toHaveBeenCalled();
-    await h.orchestrator.recover(); // re-probes on the next boot
-    expect(h.flowsheet.isOnAir).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not converge when an interrupted deactivation cannot end the show (retries next boot)', async () => {
-    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
-    h.flowsheet.end.mockRejectedValue(new Error('BS down'));
-    await h.orchestrator.recover();
-    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
-    // end() failed -> the show may still be live -> must NOT durably record INACTIVE.
-    const settled = h.stateStore.save.mock.calls.some(
-      (c) => (c[0] as Snapshot).phase === 'INACTIVE',
-    );
-    expect(settled).toBe(false);
-    await h.orchestrator.recover(); // DEACTIVATING snapshot survived -> retries end()
-    expect(h.flowsheet.end).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not converge when ending a confirmed orphan fails (retries next boot)', async () => {
-    const h = harness({ snapshot: { phase: 'ACTIVATING' }, isOnAir: true });
-    h.flowsheet.end.mockRejectedValue(new Error('BS down'));
-    await h.orchestrator.recover();
-    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // positive probe -> tried to end
-    const settled = h.stateStore.save.mock.calls.some(
-      (c) => (c[0] as Snapshot).phase === 'INACTIVE',
-    );
-    expect(settled).toBe(false);
-    await h.orchestrator.recover(); // ACTIVATING snapshot survived -> re-probes + retries
-    expect(h.flowsheet.end).toHaveBeenCalledTimes(2);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
   });
 
   it('pauses the relay and settles inactive when finishing an interrupted deactivation', async () => {

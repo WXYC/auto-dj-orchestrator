@@ -174,19 +174,13 @@ export class Orchestrator {
     }
 
     if (snap.phase === 'DEACTIVATING') {
-      // A teardown was in progress when we died — finish it, then settle INACTIVE.
-      // Only converge if end() actually succeeded: otherwise the show may still be
-      // live in BS and persisting INACTIVE would stop the next boot from re-probing
-      // (a permanent orphan). Leave the DEACTIVATING snapshot so recovery retries.
-      // Do NOT re-activate (that would resurrect a show the operator was ending).
+      // A teardown was in progress when we died — finish it (end the show, pause
+      // the relay the interrupted batch never reached) and settle INACTIVE. Do
+      // NOT re-activate (that would resurrect a show the operator was ending).
       try {
         await this.deps.flowsheet.end();
       } catch (err) {
-        this.deps.logger.warn(
-          { err },
-          'recovery: failed to finish interrupted deactivation; leaving it for the next boot to retry',
-        );
-        return;
+        this.deps.logger.warn({ err }, 'recovery: failed to finish interrupted deactivation');
       }
       await this.settleInactive();
       this.deps.logger.info(
@@ -211,21 +205,16 @@ export class Orchestrator {
         lastPostedShId: snap.lastPostedShId,
       }),
     );
-    // Re-assert the relay: a recovered live show must be routing Auto-DJ audio, but
-    // 'resume' is a one-shot command a crash (or a relay reset) may have missed.
-    this.deps.arduino.send('resume');
     this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
   }
 
   /**
    * Probe BS for a show we cannot manage (an interrupted activation left no show
-   * id, or the snapshot is unreadable) and end any orphan. Converge to INACTIVE
-   * only when the Auto-DJ is provably off — a successful end() or a definitive
-   * off-air probe. end() fires only on a POSITIVE probe (ending on an indeterminate
-   * probe with no show id could tear down a live human DJ's show; on-air/end are
-   * dj-scoped to the Auto-DJ account, WXYC/Backend-Service#1530). An indeterminate
-   * probe or a failed end() leaves the snapshot so the next boot retries — never
-   * persisting INACTIVE over an orphan we could not confirm gone.
+   * id, or the snapshot is corrupt) and end any orphan, then settle INACTIVE.
+   * end() fires only on a POSITIVE on-air probe: with no show id, ending on an
+   * indeterminate probe could tear down a live human DJ's show. The on-air/end
+   * endpoints are dj-scoped to the Auto-DJ account (WXYC/Backend-Service#1530),
+   * so a failed probe leaves any orphan for manual cleanup rather than end blind.
    */
   private async endPossibleOrphanAndSettle(): Promise<void> {
     let onAir = false;
@@ -234,28 +223,21 @@ export class Orchestrator {
     } catch (err) {
       this.deps.logger.warn(
         { err },
-        'recovery: on-air probe failed with no show id; leaving it for the next boot to retry',
+        'recovery: on-air probe failed with no show id; leaving any orphan for manual cleanup',
       );
-      return;
-    }
-    if (!onAir) {
-      // No orphan on air — nothing to end, safe to converge.
-      this.deps.logger.info('recovery: no orphaned auto-dj show on air; starting inactive');
       await this.settleInactive();
       return;
     }
-    // A confirmed orphan: only converge if we actually end it, else leave the
-    // snapshot so the next boot re-probes and retries rather than abandoning it.
-    try {
-      await this.deps.flowsheet.end();
-    } catch (err) {
-      this.deps.logger.warn(
-        { err },
-        'recovery: failed to end orphaned show; leaving it for the next boot to retry',
-      );
-      return;
+    if (onAir) {
+      try {
+        await this.deps.flowsheet.end();
+        this.deps.logger.info('recovery: ended an orphaned auto-dj show');
+      } catch (err) {
+        this.deps.logger.warn({ err }, 'recovery: failed to end orphaned show');
+      }
+    } else {
+      this.deps.logger.info('recovery: no orphaned auto-dj show on air; starting inactive');
     }
-    this.deps.logger.info('recovery: ended an orphaned auto-dj show');
     await this.settleInactive();
   }
 
@@ -317,10 +299,6 @@ export class Orchestrator {
       case 'START_SHOW': {
         const showId = await this.deps.flowsheet.join();
         await this.applyEvent({ kind: 'SHOW_STARTED', showId, epochHour: epochHour(this.now()) });
-        // SHOW_STARTED's persist is best-effort; re-persist the ACTIVE+showId marker
-        // so a single dropped write can't leave ACTIVATING on disk, which recovery
-        // would treat as an orphan to END — tearing down this healthy live show.
-        await this.deps.stateStore.save(snapshotOf(this.state));
         // Post the currently-playing track as the show's opening entry (the
         // subscriber runs continuously, so no NOW_PLAYING arrives just for
         // having activated).
