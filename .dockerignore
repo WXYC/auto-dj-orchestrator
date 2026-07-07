@@ -1,0 +1,16 @@
+# Keep the build context small and never stream local secrets/artifacts to the
+# daemon. The Dockerfile uses explicit COPY file-lists, so these are excluded from
+# the context (not just from layers): a local node_modules/dist or a real .env
+# would otherwise be uploaded on every build.
+node_modules
+dist
+coverage
+.env
+.env.*
+.git
+.gitignore
+.dockerignore
+Dockerfile
+worklog
+*.log
+.DS_Store
