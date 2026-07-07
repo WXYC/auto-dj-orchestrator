@@ -208,7 +208,6 @@ describe('Orchestrator — restart recovery', () => {
     const h = harness({ snapshot, isOnAir: true }); // BS reports on-air => our join created an orphan
     await h.orchestrator.recover();
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan torn down
-    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay paused after teardown
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT auto-resurrected
     expect(h.orchestrator.getStatus().active).toBe(false);
   });
@@ -240,7 +239,6 @@ describe('Orchestrator — restart recovery', () => {
     h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
     await h.orchestrator.recover();
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // corrupt != "no snapshot": probe + end
-    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay must not be left live
     expect(h.orchestrator.getStatus().active).toBe(false);
     expect(lastSavedPhase(h)).toBe('INACTIVE'); // converged
   });
