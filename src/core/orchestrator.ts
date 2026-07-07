@@ -36,6 +36,15 @@ const snapshotOf = (s: ActivationState): Snapshot => ({
   lastBreakpointHour: s.lastBreakpointHour,
 });
 
+/**
+ * A {@link ReduceResult} augmented with the downstream effect (if any) that
+ * failed while the orchestrator ran the batch. The pure reducer can't know this
+ * — it's set by the impure {@link Orchestrator} after {@link Orchestrator#runEffects}.
+ * `deactivate()` returns this so the router can tell a failed teardown
+ * (`failedEffect === 'END_SHOW'`) from a clean one and answer 502 vs 200.
+ */
+export type AppliedResult = ReduceResult & { failedEffect?: Effect['type'] };
+
 export class Orchestrator {
   private state: ActivationState = initialState;
   private chain: Promise<unknown> = Promise.resolve();
@@ -67,7 +76,7 @@ export class Orchestrator {
     );
   }
 
-  deactivate(): Promise<ReduceResult> {
+  deactivate(): Promise<AppliedResult> {
     return this.enqueue(() =>
       this.applyEvent({
         kind: 'DEACTIVATE_REQUESTED',
@@ -182,15 +191,21 @@ export class Orchestrator {
   }
 
   /** Reduce one event and execute its effects. NOT serialized (callers serialize). */
-  private async applyEvent(event: Event): Promise<ReduceResult> {
+  private async applyEvent(event: Event): Promise<AppliedResult> {
     const result = reduce(this.state, event);
     if (result.rejection) return result;
     this.state = result.state;
-    await this.runEffects(result.effects);
-    return result;
+    const failedEffect = await this.runEffects(result.effects);
+    return failedEffect ? { ...result, failedEffect } : result;
   }
 
-  private async runEffects(effects: Effect[]): Promise<void> {
+  /**
+   * Runs a reducer-emitted effect batch. Returns the type of the effect that
+   * failed and triggered a rollback (so callers — and the router, via
+   * `deactivate()` — can surface it), or `null` when the whole batch ran or the
+   * failure was benign (logged and skipped).
+   */
+  private async runEffects(effects: Effect[]): Promise<Effect['type'] | null> {
     for (const effect of effects) {
       try {
         await this.runEffect(effect);
@@ -199,9 +214,10 @@ export class Orchestrator {
         // If the handler rolled state back (a failed show start/end), abandon the
         // rest of THIS batch — the remaining effects were computed for the old
         // state and would otherwise re-subscribe / resume after a rollback.
-        if (await this.handleEffectFailure(effect)) return;
+        if (await this.handleEffectFailure(effect)) return effect.type;
       }
     }
+    return null;
   }
 
   private async runEffect(effect: Effect): Promise<void> {

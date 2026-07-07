@@ -199,4 +199,26 @@ describe('Orchestrator — failure handling', () => {
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
+
+  it('surfaces the teardown outcome when flowsheet.end() fails, still converging to INACTIVE', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' });
+    h.flowsheet.end.mockRejectedValueOnce(new Error('BS down'));
+    const result = await h.orchestrator.deactivate();
+    // Option A (#15): the machine still converges to INACTIVE ("better INACTIVE
+    // than stuck deactivating"), but the failed teardown is reported so the
+    // router can answer 502 instead of a misleading 200. The BS show is left
+    // orphaned — retrying it is option B, out of scope here.
+    expect(result.failedEffect).toBe('END_SHOW');
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
+  });
+
+  it('reports no failedEffect on a clean deactivation', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' });
+    const result = await h.orchestrator.deactivate();
+    expect(result.failedEffect).toBeUndefined();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
 });
