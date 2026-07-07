@@ -16,8 +16,9 @@
 # A build ARG's value IS recorded in that stage's `docker history` / layer
 # metadata, so the token-bearing stage must never be the final one: the `runtime`
 # stage below copies the already-resolved node_modules from `deps` and prunes dev
-# deps offline, so it needs no token and the shipped image carries neither the
-# secret nor a `.npmrc`. Containing the token to a discarded stage is why the
+# deps offline, so it needs no token and the shipped image carries no secret (only
+# the placeholder-only `.npmrc`, which `npm prune` needs for legacy-peer-deps).
+# Containing the token to a discarded stage is why the
 # SecretsUsedInArgOrEnv lint is skipped. The build fails loudly if neither source
 # provides a token; an empty secret file falls through to the ARG.
 FROM node:24-alpine AS deps
