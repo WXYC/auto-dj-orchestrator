@@ -162,16 +162,13 @@ describe('reduce — conflict resolution (§2.7)', () => {
 });
 
 describe('reduce — track posting + breakpoints', () => {
-  it('NOW_PLAYING while ACTIVE posts an entry and records the current track (persist deferred to ENTRY_POSTED)', () => {
+  it('NOW_PLAYING while ACTIVE posts an entry and records the current track', () => {
     const { state, effects } = reduce(activated(), {
       kind: 'NOW_PLAYING',
       track: track(1),
       at: AT,
     });
-    // No PERSIST_STATE here: the snapshot's dedupe key must only record an entry
-    // BS accepted, so PERSIST is emitted by ENTRY_POSTED after the post succeeds.
-    expect(effects).toEqual([{ type: 'POST_ENTRY', track: track(1) }]);
-    expect(state.lastPostedShId).toBe(1); // advanced in memory for same-sh_id dedupe
+    expect(effects).toEqual([{ type: 'POST_ENTRY', track: track(1) }, { type: 'PERSIST_STATE' }]);
     expect(state.currentTrack).toEqual({
       artist: 'Juana Molina',
       title: 'la paradoja',
@@ -180,32 +177,19 @@ describe('reduce — track posting + breakpoints', () => {
     });
   });
 
-  it('ENTRY_POSTED persists the advanced dedupe key only after a successful post', () => {
-    const posted = reduce(activated(), { kind: 'NOW_PLAYING', track: track(9), at: AT });
-    const confirmed = reduce(posted.state, { kind: 'ENTRY_POSTED', shId: 9 });
-    expect(confirmed.effects).toEqual([{ type: 'PERSIST_STATE' }]);
-    expect(confirmed.state.lastPostedShId).toBe(9);
-  });
-
-  it('ENTRY_POSTED is a no-op when not ACTIVE (a post confirmed after deactivation)', () => {
-    expect(reduce(initialState, { kind: 'ENTRY_POSTED', shId: 9 }).effects).toEqual([]);
-  });
-
-  it('ENTRY_POSTED does not persist when the dedupe key has already moved past the confirmed sh_id', () => {
-    const posted = reduce(activated(), { kind: 'NOW_PLAYING', track: track(10), at: AT });
-    // A late confirmation for an earlier entry (sh_id 9) must not force a persist.
-    expect(reduce(posted.state, { kind: 'ENTRY_POSTED', shId: 9 }).effects).toEqual([]);
-  });
-
   it('dedupes consecutive NOW_PLAYING with the same sh_id (no double opening entry)', () => {
     const active = activated();
     const first = reduce(active, { kind: 'NOW_PLAYING', track: track(9), at: AT });
-    expect(first.effects).toEqual([{ type: 'POST_ENTRY', track: track(9) }]);
+    expect(first.effects).toEqual([
+      { type: 'POST_ENTRY', track: track(9) },
+      { type: 'PERSIST_STATE' },
+    ]);
     expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(9), at: AT }).effects).toEqual(
       [],
     );
     expect(reduce(first.state, { kind: 'NOW_PLAYING', track: track(10), at: AT }).effects).toEqual([
       { type: 'POST_ENTRY', track: track(10) },
+      { type: 'PERSIST_STATE' },
     ]);
   });
 
