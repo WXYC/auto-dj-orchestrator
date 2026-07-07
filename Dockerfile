@@ -7,22 +7,26 @@
 # .npmrc (git-tracked, carries only the ${NPM_TOKEN} placeholder) is copied so npm
 # knows the scoped registry + auth mapping and keeps legacy-peer-deps=true.
 #
-# NPM_TOKEN reaches npm one of two ways, tried in that order:
-#   1. A BuildKit secret mount — never lands in an image layer. Local/CI:
-#        docker build --secret id=NPM_TOKEN,env=NPM_TOKEN .
-#   2. A build ARG — for platforms without build-secret support (e.g. Railway,
-#      which injects build variables as ARG/env, not BuildKit secrets). The token
-#      is referenced only through a shell variable, so it is not recorded in the
-#      image config or `docker history` (this is why the SecretsUsedInArgOrEnv
-#      lint rule is skipped above — the ARG is a deliberate, contained concession).
-#   Railway: set NPM_TOKEN as a service build variable; it arrives as the ARG.
-# The build fails loudly if neither source provides a token.
+# NPM_TOKEN is used ONLY in the `deps` stage, which is intermediate and discarded
+# from the final image. It is resolved from a BuildKit secret mount when present
+# (local/CI: `docker build --secret id=NPM_TOKEN,env=NPM_TOKEN .`), else from a
+# build ARG for platforms without build-secret support (e.g. Railway, which
+# injects build variables as ARG/env, not BuildKit secrets).
+#
+# A build ARG's value IS recorded in that stage's `docker history` / layer
+# metadata, so the token-bearing stage must never be the final one: the `runtime`
+# stage below copies the already-resolved node_modules from `deps` and prunes dev
+# deps offline, so it needs no token and the shipped image carries neither the
+# secret nor a `.npmrc`. Containing the token to a discarded stage is why the
+# SecretsUsedInArgOrEnv lint is skipped. The build fails loudly if neither source
+# provides a token; an empty secret file falls through to the ARG.
 FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json .npmrc ./
 ARG NPM_TOKEN
 RUN --mount=type=secret,id=NPM_TOKEN \
-    TOKEN="$(cat /run/secrets/NPM_TOKEN 2>/dev/null || printf '%s' "$NPM_TOKEN")"; \
+    TOKEN="$(cat /run/secrets/NPM_TOKEN 2>/dev/null)"; \
+    [ -n "$TOKEN" ] || TOKEN="$NPM_TOKEN"; \
     [ -n "$TOKEN" ] || { echo 'NPM_TOKEN not provided: pass a BuildKit --secret or a build ARG'; exit 1; }; \
     NPM_TOKEN="$TOKEN" npm ci
 
@@ -36,12 +40,14 @@ RUN npm run build
 FROM node:24-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+# .npmrc (placeholder-only, no secret) is needed for `npm prune` to honour
+# legacy-peer-deps and the scoped-registry mapping; it carries no token.
 COPY package.json package-lock.json .npmrc ./
-ARG NPM_TOKEN
-RUN --mount=type=secret,id=NPM_TOKEN \
-    TOKEN="$(cat /run/secrets/NPM_TOKEN 2>/dev/null || printf '%s' "$NPM_TOKEN")"; \
-    [ -n "$TOKEN" ] || { echo 'NPM_TOKEN not provided: pass a BuildKit --secret or a build ARG'; exit 1; }; \
-    NPM_TOKEN="$TOKEN" npm ci --omit=dev
+# No NPM_TOKEN here: reuse the deps stage's already-authenticated install and
+# prune devDependencies offline, so the final image never touches GitHub Packages
+# and no build ARG or secret can reach a shipped layer or `docker history`.
+COPY --from=deps /app/node_modules ./node_modules
+RUN npm prune --omit=dev
 COPY --from=build /app/dist ./dist
 EXPOSE 8090
 HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
