@@ -169,7 +169,6 @@ export class Orchestrator {
         { showId: snap.showId },
         'snapshot was active but BS reports off-air; settling inactive',
       );
-      this.deps.arduino.send('pause');
       await this.settleInactive();
       return;
     }
@@ -183,7 +182,6 @@ export class Orchestrator {
       } catch (err) {
         this.deps.logger.warn({ err }, 'recovery: failed to finish interrupted deactivation');
       }
-      this.deps.arduino.send('pause');
       await this.settleInactive();
       this.deps.logger.info(
         { showId: snap.showId },
@@ -250,6 +248,12 @@ export class Orchestrator {
    */
   private async settleInactive(): Promise<void> {
     this.state = { ...initialState };
+    // INACTIVE means auto-DJ is off, so the relay must not be left routing Auto-DJ
+    // audio to air (it may still be in 'resume' from a prior activation). Every
+    // convergence path funnels through here, so the pause is issued once and
+    // consistently — including the end-an-orphan path, which otherwise ended the
+    // BS show but left the relay live.
+    this.deps.arduino.send('pause');
     await this.deps.stateStore.save(snapshotOf(this.state));
   }
 
