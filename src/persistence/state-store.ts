@@ -63,9 +63,7 @@ export class StateStore {
       await writeFile(tmp, JSON.stringify(snapshot), 'utf8');
       await rename(tmp, this.path);
     } catch (err) {
-      // recursive so a stray directory at the fixed temp path can't wedge every
-      // future write (writeFile would keep throwing EISDIR otherwise).
-      await rm(tmp, { force: true, recursive: true }).catch(() => {});
+      await rm(tmp, { force: true }).catch(() => {});
       throw err;
     }
   }
