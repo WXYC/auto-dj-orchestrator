@@ -292,6 +292,47 @@ describe('Orchestrator — restart recovery', () => {
     expect(persistedShId()).toBe(901);
   });
 
+  // Grab the ACTIVE marker the way it is persisted, to feed a *real* restart.
+  const activeSnapshotOf = (h: ReturnType<typeof harness>): Snapshot =>
+    h.stateStore.saveStrict.mock.calls.at(-1)![0] as Snapshot;
+
+  it('retries a failed post after an ACTUAL restart (a fresh orchestrator rebuilt from the snapshot)', async () => {
+    const first = harness({ isOnAir: true });
+    await first.orchestrator.activate({ userId: 'u1' });
+    const snap = activeSnapshotOf(first); // ACTIVE, no dedupe key yet
+    // The post FAILS, so no dedupe key is durably recorded.
+    first.flowsheet.addEntry.mockRejectedValueOnce(new Error('BS 500'));
+    await first.orchestrator.onTrack(track(900));
+    expect(first.flowsheet.addEntry).toHaveBeenCalledWith(track(900)); // attempted once
+
+    // Actually restart: a brand-new orchestrator recovering from the persisted
+    // snapshot (which never recorded 900). This is what the in-instance re-dispatch
+    // above cannot prove — that the dedupe key survives (or here, correctly does not
+    // survive) a process boundary.
+    const second = harness({ snapshot: snap, isOnAir: true });
+    await second.orchestrator.recover();
+    await second.orchestrator.onTrack(track(900)); // the same track is re-seen
+    expect(second.flowsheet.addEntry).toHaveBeenCalledWith(track(900)); // re-posted, not dropped
+  });
+
+  it('re-posts at most one duplicate (never a drop) when the dedupe-key persist is lost in a crash', async () => {
+    const first = harness({ isOnAir: true });
+    await first.orchestrator.activate({ userId: 'u1' });
+    const snap = activeSnapshotOf(first); // captured BEFORE the post
+    // The post SUCCEEDS, but the ENTRY_POSTED dedupe-key persist is lost in the crash
+    // window — model that by recovering from the pre-post ACTIVE snapshot.
+    await first.orchestrator.onTrack(track(900));
+    expect(first.flowsheet.addEntry).toHaveBeenCalledWith(track(900)); // posted once
+
+    const second = harness({ snapshot: snap, isOnAir: true });
+    await second.orchestrator.recover();
+    await second.orchestrator.onTrack(track(900)); // subscriber re-polls the still-playing track
+    // At-least-once: the track re-posts (exactly one duplicate) rather than being
+    // dropped — the dedupe key was never durably recorded, so recovery can't suppress
+    // it. The design prefers a possible duplicate over a lost entry.
+    expect(second.flowsheet.addEntry).toHaveBeenCalledWith(track(900));
+  });
+
   it('ends an orphaned show and stays inactive when an interrupted activation is recovered', async () => {
     // Crashed mid-join: ACTIVATING persisted, but the show id was never learned.
     const snapshot: Snapshot = { phase: 'ACTIVATING' };
@@ -489,9 +530,10 @@ describe('Orchestrator — failure handling', () => {
     // never set (we never learned it) — orphan cleanup is showId-free (dj-scoped end).
     expect(h.orchestrator.getStatus().active).toBe(true);
     expect(h.orchestrator.getStatus().showId).toBeUndefined();
-    const savedPhases = [...h.stateStore.saveStrict.mock.calls, ...h.stateStore.save.mock.calls].map(
-      (c) => (c[0] as Snapshot).phase,
-    );
+    const savedPhases = [
+      ...h.stateStore.saveStrict.mock.calls,
+      ...h.stateStore.save.mock.calls,
+    ].map((c) => (c[0] as Snapshot).phase);
     expect(savedPhases).not.toContain('INACTIVE');
     expect(savedPhases).toContain('ACTIVATING');
   });

@@ -71,9 +71,5 @@ export const initialState: ActivationState = {
  * The 502-vs-200 distinction on /deactivate rides `failedEffect`, not this.
  */
 export function isActive(state: ActivationState): boolean {
-  return (
-    state.phase === 'ACTIVE' ||
-    state.phase === 'ACTIVATING' ||
-    state.phase === 'DEACTIVATING'
-  );
+  return state.phase === 'ACTIVE' || state.phase === 'ACTIVATING' || state.phase === 'DEACTIVATING';
 }
