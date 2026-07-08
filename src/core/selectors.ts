@@ -39,21 +39,41 @@ export function selectStatus(
 /**
  * Reduce a full {@link AutoDJStatus} to the projection served to authenticated
  * users below the `dj` role (networking-spec §3.10.4: "`dj` role or higher for
- * full status"). Strips the identity/internal fields — `activatedBy`,
- * `lastDeactivatedBy`, and `showId` — from BOTH branches: `activatedBy` /
- * `showId` when active, `lastDeactivatedBy` when inactive (the deactivating
- * DJ's Better Auth `userId` would otherwise leak while auto-DJ is off).
+ * full status").
  *
- * Everything else is kept, notably `currentTrack` — it is broadcast over the
- * air and dj-site's greyscale member banner renders it — along with `active`,
- * `device`, and the activation/deactivation timestamps. The reduced object omits
- * only optional fields, so it is still a valid `AutoDJStatus` (no `api.yaml`
- * change). Pure: returns a fresh object, never mutates the input.
+ * This is an ALLOWLIST, not a denylist: it copies only the below-`dj`-safe
+ * fields and drops everything else, so it fails CLOSED. The identity/internal
+ * fields — `activatedBy` and `lastDeactivatedBy` (the activating / last
+ * deactivating DJ's Better Auth `userId`) and the internal `showId` — are absent
+ * by construction in both the active and inactive branches. A field later added
+ * to the `AutoDJStatus` schema is hidden from members by default rather than
+ * leaked, and the compile-time tie below forces each new field to be classified.
+ *
+ * Kept: `active`, `device`, `currentTrack` (broadcast over the air; dj-site's
+ * greyscale member banner renders it), and the activation/deactivation
+ * timestamps. Pure: returns a fresh object, never mutates the input.
  */
 export function reduceStatusBelowDj(status: AutoDJStatus): AutoDJStatus {
-  const { activatedBy, lastDeactivatedBy, showId, ...reduced } = status;
-  return reduced;
+  return {
+    active: status.active,
+    activatedAt: status.activatedAt,
+    currentTrack: status.currentTrack,
+    lastDeactivatedAt: status.lastDeactivatedAt,
+    device: status.device,
+  };
 }
+
+// Compile-time exhaustiveness tie (mirrors codec.ts's `_AssertInboundMatchesContract`):
+// every `AutoDJStatus` field must be classified as kept-for-members or hidden. Add
+// a field to the schema without listing it in the projection above and one of these
+// unions and `tsc` fails here — so the redaction can never silently pass a new
+// identity/internal field through to below-`dj` users.
+type BelowDjKeptField = 'active' | 'activatedAt' | 'currentTrack' | 'lastDeactivatedAt' | 'device';
+type BelowDjHiddenField = 'activatedBy' | 'lastDeactivatedBy' | 'showId';
+type _AssertStatusFieldsClassified =
+  Exclude<keyof AutoDJStatus, BelowDjKeptField | BelowDjHiddenField> extends never ? true : never;
+const _statusFieldsClassifiedTie: _AssertStatusFieldsClassified = true;
+void _statusFieldsClassifiedTie;
 
 export function selectDeactivateResponse(state: ActivationState): AutoDJDeactivateResponse {
   const by = state.lastDeactivatedBy;
