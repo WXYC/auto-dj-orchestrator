@@ -231,6 +231,33 @@ describe('Orchestrator — restart recovery', () => {
     expect(lastSavedPhase(h)).toBe('INACTIVE');
   });
 
+  it('reconfirms a boot DEACTIVATING that reads off-air, converging only on a second off-air read', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 } });
+    h.flowsheet.isOnAir.mockResolvedValue(false); // both reads off-air
+    await h.orchestrator.recover();
+    // A single off-air read is NOT confirmation for DEACTIVATING either: if the teardown
+    // failed pre-restart the show may still be live, and a false-negative would orphan it.
+    // Do not settle or end on the first read; arm the two-read reconfirm.
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    expect(h.stateStore.save).not.toHaveBeenCalled();
+    // The reconcile tick re-probes; a second off-air read converges INACTIVE.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.isOnAir).toHaveBeenCalledTimes(2);
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('retries end() when a boot DEACTIVATING reconfirm finds the show still live (false negative)', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 } });
+    h.flowsheet.isOnAir.mockResolvedValueOnce(false).mockResolvedValueOnce(true); // off then on
+    await h.orchestrator.recover(); // first probe off -> arm reconfirm (no end yet)
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    // Second read is on-air: the teardown target is STILL live, so end() it (the operator
+    // wanted it off) rather than re-attaching — then converge.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
   it('re-attaches optimistically when the on-air probe throws (avoids orphaning a live show)', async () => {
     const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
     const h = harness({ snapshot });
@@ -569,6 +596,23 @@ describe('Orchestrator — failure handling', () => {
     const savedPhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
     expect(savedPhases).not.toContain('INACTIVE');
     expect(savedPhases).toContain('DEACTIVATING');
+  });
+
+  it('preserves the deactivation attribution when the reconciler converges a stuck teardown', async () => {
+    const h = harness({ isOnAir: true });
+    await h.orchestrator.activate({ userId: 'u1' });
+    // A live DJ triggers the teardown (source 'relay'), but end() fails → stuck
+    // DEACTIVATING with lastDeactivatedBy = {source:'relay'}.
+    h.flowsheet.end.mockRejectedValueOnce(new Error('BS down'));
+    await h.orchestrator.relayState(true);
+    expect(h.orchestrator.getStatus().active).toBe(true); // DEACTIVATING, teardown pending
+    // The reconciler converges once the show reads off-air. The "who deactivated"
+    // attribution must survive settleInactive (the inline SHOW_ENDED path keeps it),
+    // so a live-DJ takeover is not silently re-attributed to the virtual switch.
+    h.flowsheet.isOnAir.mockResolvedValue(false);
+    await h.orchestrator.reconcileTransitional();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(h.orchestrator.getStatus().lastDeactivatedBy?.source).toBe('relay');
   });
 
   it('reports no failedEffect on a clean deactivation', async () => {
