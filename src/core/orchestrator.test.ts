@@ -136,12 +136,22 @@ describe('Orchestrator — restart recovery', () => {
       lastBreakpointHour: 100,
     };
     const h = harness({ snapshot, isOnAir: true });
-    await h.orchestrator.recover();
+    const recovery = await h.orchestrator.recover();
     const status = h.orchestrator.getStatus();
     expect(status.active).toBe(true);
     expect(status.showId).toBe(789);
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // no duplicate join
-    expect(h.arduino.send).toHaveBeenCalledWith('resume'); // relay re-asserted on re-attach
+    // item 9: the relay resume is DEFERRED — recover() reports it is needed but does
+    // not send it inline, so index.ts can start the subscriber first (letting a live
+    // DJ preempt) before re-asserting the relay.
+    expect(recovery.needsResume).toBe(true);
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
+  });
+
+  it('does not report a needed resume when recovery does not re-attach (off-air / no snapshot)', async () => {
+    const h = harness({ snapshot: null });
+    const recovery = await h.orchestrator.recover();
+    expect(recovery.needsResume).toBe(false);
   });
 
   it('restores the persisted breakpoint hour on re-attach so the next hour still posts its breakpoint', async () => {
