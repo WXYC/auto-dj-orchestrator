@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { chmod, mkdir, mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CorruptSnapshotError, StateStore, TransientReadError, type Snapshot } from './state-store.js';
+import {
+  CorruptSnapshotError,
+  StateStore,
+  TransientReadError,
+  type Snapshot,
+} from './state-store.js';
 import type { Logger } from '../logger.js';
 
 const fakeLogger = () => {

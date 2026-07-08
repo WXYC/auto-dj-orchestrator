@@ -359,11 +359,16 @@ export class Orchestrator {
     if (probeFailed) return; // still can't tell — retry next tick
     this.reconfirmOffAir = null;
     if (!onAir) {
-      this.deps.logger.info('recovery: ACTIVE snapshot confirmed off-air across two reads; settling inactive');
+      this.deps.logger.info(
+        'recovery: ACTIVE snapshot confirmed off-air across two reads; settling inactive',
+      );
       await this.settleInactive();
       return;
     }
-    this.deps.logger.info({ showId: snap.showId }, 'recovery: reconfirm read on-air (false negative); re-attaching');
+    this.deps.logger.info(
+      { showId: snap.showId },
+      'recovery: reconfirm read on-air (false negative); re-attaching',
+    );
     await this.attachRecoveredShow(snap, { sendResume: true });
   }
 
@@ -553,8 +558,14 @@ export class Orchestrator {
       // source 'virtual_switch': the DEACTIVATE_REQUESTED event source is limited to
       // 'virtual_switch' | 'button', and the wire AutoDJActivationSource enum has no
       // internal member, so we reuse 'virtual_switch' rather than break the contract.
-      this.deps.logger.warn('post-join ACTIVE persist failed; rolling the show back through teardown');
-      await this.applyEvent({ kind: 'DEACTIVATE_REQUESTED', source: 'virtual_switch', at: this.nowIso() });
+      this.deps.logger.warn(
+        'post-join ACTIVE persist failed; rolling the show back through teardown',
+      );
+      await this.applyEvent({
+        kind: 'DEACTIVATE_REQUESTED',
+        source: 'virtual_switch',
+        at: this.nowIso(),
+      });
       return true;
     }
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {
