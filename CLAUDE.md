@@ -20,6 +20,10 @@ Arduino ──(WS mgmt channel + HTTP fallback)─────────┤─
 
 Conflict rules (networking-spec §2.7): live DJ always wins; button ≡ virtual switch (last wins); no auto-reactivation after a live DJ clears.
 
+## Flowsheet posting guarantee (at-least-once)
+
+Entry posting is deliberately **at-least-once, never at-most-once**: `ENTRY_POSTED` persists the advanced dedupe key (`lastPostedShId`) only _after_ `flowsheet.addEntry()` succeeds (`src/core/orchestrator.ts` `POST_ENTRY` → `src/core/activation-state-machine.ts` `ENTRY_POSTED`). A failed post is retried rather than durably recorded as sent, so no entry is ever dropped; the price is that an ill-timed crash — BS accepts the entry, the process dies before the persist — re-posts one track on restart. At most one duplicate, never a drop. **Invariant: do not "tighten" these best-effort dedupe-key persists to `saveStrict`, and do not persist the key before the post — either change trades a duplicate for a dropped entry.** True exactly-once needs a client-supplied idempotency key on `addEntry()` that BS deduplicates on; that is a Backend-Service enhancement, tracked in [WXYC/Backend-Service#1545](https://github.com/WXYC/Backend-Service/issues/1545).
+
 ## Layout
 
 | Path               | Role                                                                                     |

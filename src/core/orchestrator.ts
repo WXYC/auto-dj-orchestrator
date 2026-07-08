@@ -609,7 +609,9 @@ export class Orchestrator {
         await this.deps.flowsheet.addEntry(effect.track);
         // Persist the advanced dedupe key only after BS accepts the entry, so a
         // failed post isn't durably recorded as "already posted" (which would
-        // drop the track across a restart).
+        // drop the track across a restart). Exactly-once (deduping a re-post
+        // after a crash) needs a client idempotency key on addEntry —
+        // WXYC/Backend-Service#1545.
         await this.applyEvent({ kind: 'ENTRY_POSTED', shId: effect.track.shId });
         break;
       case 'POST_BREAKPOINT':
