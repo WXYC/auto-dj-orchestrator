@@ -255,7 +255,7 @@ describe('reduce — restart recovery', () => {
       kind: 'RECOVERED',
       showId: 789,
       activatedBy: { source: 'virtual_switch', userId: 'u1', at: AT },
-      epochHour: 100,
+      lastBreakpointHour: 100,
       lastPostedShId: 555,
     });
     expect(state.phase).toBe('ACTIVE');

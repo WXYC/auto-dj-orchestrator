@@ -36,7 +36,7 @@ export type Event =
       kind: 'RECOVERED';
       showId: number;
       activatedBy: Activation;
-      epochHour: number;
+      lastBreakpointHour: number;
       lastPostedShId?: number;
     };
 
@@ -255,7 +255,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           phase: 'ACTIVE',
           showId: event.showId,
           activatedBy: event.activatedBy,
-          lastBreakpointHour: event.epochHour,
+          lastBreakpointHour: event.lastBreakpointHour,
           currentTrack: null,
           lastPostedShId: event.lastPostedShId,
         },
