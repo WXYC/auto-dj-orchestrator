@@ -527,3 +527,94 @@ describe('Orchestrator — failure handling', () => {
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
   });
 });
+
+describe('Orchestrator — reconcile (periodic driver)', () => {
+  it('retries a stuck DEACTIVATING and converges when end() finally succeeds', async () => {
+    const h = harness({ isOnAir: true });
+    await h.orchestrator.activate({ userId: 'u1' });
+    h.flowsheet.end.mockRejectedValueOnce(new Error('BS down')); // first teardown fails
+    await h.orchestrator.deactivate();
+    expect(h.orchestrator.getStatus().active).toBe(true); // stuck DEACTIVATING (item 1)
+    // A reconcile tick probes on-air and retries end() — which succeeds now — so the
+    // in-process teardown converges without waiting for a restart (closes R3 + item 1).
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.isOnAir).toHaveBeenCalled();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(2); // retried
+    expect(h.orchestrator.getStatus().active).toBe(false); // converged INACTIVE
+  });
+
+  it('leaves a DEACTIVATING show put when end() keeps failing', async () => {
+    const h = harness({ isOnAir: true });
+    await h.orchestrator.activate({ userId: 'u1' });
+    h.flowsheet.end.mockRejectedValue(new Error('BS down')); // persistent
+    await h.orchestrator.deactivate();
+    await h.orchestrator.reconcileTransitional(); // probe on-air, end fails again -> leave
+    expect(h.orchestrator.getStatus().active).toBe(true); // still DEACTIVATING; retry next tick
+  });
+
+  it('ends an on-air orphan from a stuck ACTIVATING and converges', async () => {
+    const h = harness({ isOnAir: true });
+    h.flowsheet.join.mockRejectedValueOnce(new Error('response dropped')); // stuck ACTIVATING (item 2)
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan ended
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('is a no-op in INACTIVE and ACTIVE (never probes or ends)', async () => {
+    const h = harness({ isOnAir: true });
+    await h.orchestrator.reconcileTransitional(); // INACTIVE
+    expect(h.flowsheet.isOnAir).not.toHaveBeenCalled();
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+
+    await h.orchestrator.activate({ userId: 'u1' }); // ACTIVE
+    h.flowsheet.isOnAir.mockClear();
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.isOnAir).not.toHaveBeenCalled(); // ACTIVE is a no-op
+    expect(h.orchestrator.getStatus().active).toBe(true); // untouched
+  });
+
+  it('re-reads phase INSIDE the enqueued unit: a reconcile queued behind a converging teardown no-ops', async () => {
+    const h = harness({ isOnAir: true });
+    await h.orchestrator.activate({ userId: 'u1' });
+    // Hold end() open so the teardown parks in DEACTIVATING while a reconcile queues behind it.
+    let releaseEnd!: () => void;
+    const endGate = new Promise<void>((res) => {
+      releaseEnd = res;
+    });
+    h.flowsheet.end.mockImplementationOnce(async () => {
+      await endGate;
+    });
+    const deactivating = h.orchestrator.deactivate();
+    await new Promise((r) => setTimeout(r, 0)); // let the teardown reach the parked end(); phase = DEACTIVATING
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    const reconciling = h.orchestrator.reconcileTransitional(); // CALLED at DEACTIVATING, QUEUES behind
+    releaseEnd(); // end() resolves -> SHOW_ENDED -> INACTIVE
+    await deactivating;
+    await reconciling;
+    // The reconcile ran after the teardown converged; re-reading phase INSIDE the unit,
+    // it saw INACTIVE and no-op'd. Had it captured the call-time DEACTIVATING, it would
+    // have probed and re-ended.
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(h.flowsheet.isOnAir).not.toHaveBeenCalled();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('the periodic ticker drives the reconciler (a stuck teardown recovers without a restart)', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ isOnAir: true });
+      await h.orchestrator.activate({ userId: 'u1' });
+      h.flowsheet.end.mockRejectedValueOnce(new Error('BS down'));
+      await h.orchestrator.deactivate(); // stuck DEACTIVATING
+      expect(h.orchestrator.getStatus().active).toBe(true);
+      h.orchestrator.start(); // arms the 60s ticker
+      await vi.advanceTimersByTimeAsync(60_000); // one tick drives reconcileTransitional
+      expect(h.orchestrator.getStatus().active).toBe(false); // converged without a restart
+      h.orchestrator.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

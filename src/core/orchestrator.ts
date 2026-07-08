@@ -109,11 +109,40 @@ export class Orchestrator {
     );
   }
 
-  /** Start the hourly-breakpoint ticker. Idempotent. */
+  /**
+   * Periodic reconciler (R3). Drives a *transitional* phase toward its terminal
+   * phase by probing BS truth and retrying the effect — the same convergence
+   * recover() runs at boot, but on a tick so an in-process failure (a failed
+   * teardown left DEACTIVATING by handleEffectFailure, or a failed activation left
+   * ACTIVATING) is retried without waiting for a restart. Without it, R2's "leave
+   * the transitional phase durable" would have nothing to retry it in-process.
+   *
+   * Both transitional phases route through endPossibleOrphanAndSettle (probe on-air,
+   * end any orphan, converge only if gone) — it is strictly more robust than a bare
+   * end()-retry for DEACTIVATING because the tick has no prior probe, so it converges
+   * correctly even when the show already ended out of band and end() would error.
+   * ACTIVE / INACTIVE are no-ops. Serialized through enqueue so it can't race normal
+   * operation, and the phase is re-read INSIDE the enqueued unit so a reconcile that
+   * queued behind a concurrent activation/teardown no-ops once that unit converged.
+   */
+  reconcileTransitional(): Promise<void> {
+    return this.enqueue(async () => {
+      const phase = this.state.phase; // re-read inside the unit, not at call time
+      if (phase === 'ACTIVATING' || phase === 'DEACTIVATING') {
+        await this.endPossibleOrphanAndSettle();
+      }
+      // ACTIVE / INACTIVE: nothing to reconcile.
+    });
+  }
+
+  /** Start the hourly-breakpoint ticker and the periodic reconciler. Idempotent. */
   start(): void {
     if (this.ticker) return;
     this.ticker = setInterval(() => {
       void this.hourTick().catch((err) => this.deps.logger.error({ err }, 'hour tick failed'));
+      void this.reconcileTransitional().catch((err) =>
+        this.deps.logger.error({ err }, 'reconcile tick failed'),
+      );
     }, this.deps.tickIntervalMs ?? 60_000);
   }
 
