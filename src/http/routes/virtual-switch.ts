@@ -43,11 +43,14 @@ export function virtualSwitchRouter(deps: {
         .json({ error: 'Auto-DJ is already active', status: orchestrator.getStatus() });
       return;
     }
-    // The reducer accepted the request, but a downstream effect (e.g. the BS
-    // show-start) may have failed and rolled the state back. Surface that as a
-    // 502 rather than a misleading 200.
+    // The reducer accepted the request, but a downstream effect (the BS show-start,
+    // or the activation-intent/ACTIVE persist) may have failed. Key off the reported
+    // failedEffect, NOT getStatus().active: a failed START_SHOW leaves phase
+    // ACTIVATING and a failed post-join persist rolls to DEACTIVATING, both of which
+    // isActive() counts as on-air — so `active` is true for a failed activation and
+    // cannot distinguish it. Symmetric with /deactivate's END_SHOW 502.
     const status = orchestrator.getStatus();
-    if (!status.active) {
+    if (result.failedEffect) {
       res.status(502).json({ error: 'Activation failed (backend unavailable)', status });
       return;
     }

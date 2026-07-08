@@ -519,6 +519,17 @@ describe('Orchestrator — failure handling', () => {
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
 
+  it('surfaces failedEffect from activate() so the /activate route can 502 (active alone cannot)', async () => {
+    const h = harness();
+    h.flowsheet.join.mockRejectedValueOnce(new Error('BS down'));
+    const result = await h.orchestrator.activate({ userId: 'u1' });
+    // The failed activation leaves phase ACTIVATING, which isActive() reports as
+    // active:true — so the router MUST key off failedEffect, which activate() now
+    // surfaces (symmetric with deactivate()).
+    expect(result.failedEffect).toBe('START_SHOW');
+    expect(h.orchestrator.getStatus().active).toBe(true);
+  });
+
   it('leaves the ACTIVATING marker for recovery when join() created a show but dropped the response', async () => {
     const h = harness({ isOnAir: true });
     // join() reaches BS and creates a show, but the response is lost, so it throws —
@@ -731,5 +742,59 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
     expect(status.active).toBe(true);
     expect(status.showId).toBe(701); // still the live show, NOT rewound to 789
     expect(status.activatedBy?.userId).toBe('u1'); // attribution intact, not "recovered"
+  });
+
+  it('drops a stale reconfirm after a full activate/deactivate cycle back to INACTIVE', async () => {
+    // Boot arms reconfirm(789) (ACTIVE snapshot, first probe off-air).
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValue(false);
+    await h.orchestrator.recover();
+    // A full activate -> deactivate cycle returns the machine to INACTIVE within the
+    // reconfirm window. The reconfirm was armed for a DIFFERENT (now-defunct) show, so
+    // leaving INACTIVE must drop it — otherwise a later tick, seeing phase INACTIVE
+    // again, would re-attach the dead show 789.
+    await h.orchestrator.activate({ userId: 'u1' }); // INACTIVE -> ACTIVE (701)
+    await h.orchestrator.deactivate(); // ACTIVE -> INACTIVE
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    h.flowsheet.isOnAir.mockResolvedValue(true); // pretend a probe would now read on-air
+    await h.orchestrator.reconcileTransitional();
+    // The stale reconfirm was cleared on activation, so the tick does not re-attach 789.
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(h.orchestrator.getStatus().showId).toBeUndefined();
+  });
+
+  it('retries a transient boot-read failure on the next reconcile tick (in-process, no restart)', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot, isOnAir: true });
+    // First load() throws a transient read fault; recover() leaves state for a retry
+    // (does not end the possibly-live show) and returns needsResume:false.
+    h.stateStore.load.mockRejectedValueOnce(new TransientReadError('EIO'));
+    const r1 = await h.orchestrator.recover();
+    expect(r1.needsResume).toBe(false);
+    expect(h.orchestrator.getStatus().active).toBe(false); // nothing attached yet
+    // The next reconcile tick re-runs recovery in-process; load() now succeeds, so the
+    // ACTIVE show is re-attached WITHOUT waiting for a full process restart.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    expect(h.orchestrator.getStatus().showId).toBe(789);
+    expect(h.arduino.send).toHaveBeenCalledWith('resume'); // re-attach resumes the relay
+  });
+
+  it('does not re-attach over a live DJ when the reconfirm probe reads on-air', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValueOnce(false); // boot -> arm reconfirm
+    await h.orchestrator.recover();
+    // A live DJ takes the relay during the reconfirm window. At phase INACTIVE this
+    // only records liveDj (no phase change), so the reconfirm stays armed.
+    await h.orchestrator.relayState(true);
+    // The reconfirm probe reads on-air (the old Auto-DJ show is still marked live in
+    // BS), but a live DJ is present — live-DJ-wins, so do NOT re-attach or resume.
+    h.flowsheet.isOnAir.mockResolvedValueOnce(true);
+    h.arduino.send.mockClear();
+    await h.orchestrator.reconcileTransitional();
+    expect(h.orchestrator.getStatus().active).toBe(false); // did not re-attach
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume'); // did not route Auto-DJ over the DJ
   });
 });
