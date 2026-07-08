@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { StateStore, type Snapshot } from './state-store.js';
+import { CorruptSnapshotError, StateStore, TransientReadError, type Snapshot } from './state-store.js';
 import type { Logger } from '../logger.js';
 
 const fakeLogger = () => {
@@ -47,21 +47,25 @@ describe('StateStore', () => {
       expect(logger.error).not.toHaveBeenCalled();
     });
 
-    it('throws when the snapshot is corrupt (so recovery can probe instead of silently orphaning)', async () => {
+    it('throws CorruptSnapshotError when the snapshot is corrupt JSON (recovery probes, not orphans)', async () => {
       await writeFile(path, '{ this is not: valid json', 'utf8');
       const store = new StateStore(path);
-      // A corrupt snapshot means a show may be on air; throwing (vs. the null a
-      // missing file returns) lets recover() probe BS and end any orphan rather
-      // than starting inactive and orphaning it.
-      await expect(store.load()).rejects.toThrow(/corrupt/i);
+      // A corrupt (parse-error) snapshot is PERMANENT: a show may be on air, so
+      // throwing CorruptSnapshotError (vs. the null a missing file returns) lets
+      // recover() probe BS and end any orphan rather than orphaning it.
+      await expect(store.load()).rejects.toBeInstanceOf(CorruptSnapshotError);
     });
 
-    it('throws when the snapshot exists but cannot be read (not ENOENT), so recovery still probes', async () => {
-      // A directory at the snapshot path makes readFile throw EISDIR — a non-ENOENT
-      // read error, the same "persisted but unreadable" condition as corrupt JSON.
+    it('throws TransientReadError on a retriable read fault (EISDIR), so recovery does not end a live show', async () => {
+      // A directory at the snapshot path makes readFile throw EISDIR — a *retriable*
+      // fault (item 7): a redeploy can momentarily surface EISDIR/EACCES/EIO. Unlike
+      // corrupt JSON this is uncertainty, not confirmation, so recover() must leave
+      // the on-disk state and retry rather than ending a possibly-live show.
       await mkdir(path);
       const store = new StateStore(path);
-      await expect(store.load()).rejects.toThrow(/unreadable/i);
+      const err = await store.load().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(TransientReadError);
+      expect((err as TransientReadError).code).toBe('EISDIR');
     });
   });
 

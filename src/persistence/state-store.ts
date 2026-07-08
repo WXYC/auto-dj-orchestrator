@@ -18,6 +18,37 @@ export interface Snapshot {
   lastPostedShId?: number;
 }
 
+/**
+ * The snapshot exists but is PERMANENTLY unreadable — corrupt JSON, or a read
+ * fault whose errno we don't recognize. A show may be on air with an id we can't
+ * recover, so recover() must probe BS and end any orphan rather than mistake this
+ * for "no snapshot" and orphan a live show.
+ */
+export class CorruptSnapshotError extends Error {}
+
+/**
+ * The snapshot read failed on a RETRIABLE fault — a transient disk/mount/perms
+ * blip, the kind a redeploy can momentarily surface. recover() treats this like an
+ * indeterminate probe: leave the on-disk state and let a later reconcile / the next
+ * boot retry, rather than ending a possibly-live show on a momentary read error.
+ */
+export class TransientReadError extends Error {
+  constructor(
+    readonly code: string,
+    options?: ErrorOptions,
+  ) {
+    super(`auto-dj state snapshot read failed transiently (${code})`, options);
+  }
+}
+
+// errnos treated as retriable rather than permanent corruption. A redeploy can
+// momentarily surface these (EIO disk fault, EACCES ownership/perms change, EISDIR
+// mid-mount, EBUSY/EAGAIN/ETIMEDOUT). Deliberately conservative: an UNKNOWN errno
+// falls through to CorruptSnapshotError (probe-and-end), so a misclassified fault
+// fails safe toward ending an orphan, never toward leaving one running. Widen only
+// with evidence.
+const RETRIABLE_READ_ERRNOS = new Set(['EIO', 'EACCES', 'EAGAIN', 'EBUSY', 'EISDIR', 'ETIMEDOUT']);
+
 export class StateStore {
   constructor(
     private readonly path: string,
@@ -29,22 +60,26 @@ export class StateStore {
     try {
       raw = await readFile(this.path, 'utf8');
     } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
       // ENOENT is normal (first boot, or after a clean deactivate) -> null.
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      // Any other read error (EACCES from a perms/owner change, EIO from a disk
-      // fault, EISDIR) means a snapshot exists but is unreadable — a show may be on
-      // air. Throw, like the corrupt-JSON case, so recover() probes BS and ends any
-      // orphan rather than mistaking this for "no snapshot" and orphaning a live show.
-      throw new Error('auto-dj state snapshot is unreadable', { cause: err });
+      if (code === 'ENOENT') return null;
+      // A retriable fault (a redeploy-time disk/mount/perms blip) is uncertainty,
+      // not confirmation: recover() leaves the snapshot and retries rather than
+      // ending a possibly-live show. An unknown errno fails safe as CorruptSnapshot
+      // (probe-and-end) — never leave a real orphan running on a misclassification.
+      if (code && RETRIABLE_READ_ERRNOS.has(code)) {
+        throw new TransientReadError(code, { cause: err });
+      }
+      throw new CorruptSnapshotError('auto-dj state snapshot is unreadable', { cause: err });
     }
     try {
       return JSON.parse(raw) as Snapshot;
     } catch (err) {
-      // A corrupt snapshot means something WAS persisted but is now unreadable —
-      // a show may be on air. Throw (rather than returning null, which is
-      // indistinguishable from "no snapshot") so recover() can probe BS and end
-      // any orphan instead of silently starting inactive and orphaning it.
-      throw new Error('auto-dj state snapshot is corrupt', { cause: err });
+      // A corrupt (parse-error) snapshot is PERMANENT: something WAS persisted but is
+      // now unreadable — a show may be on air. Throw (rather than returning null,
+      // which is indistinguishable from "no snapshot") so recover() probes BS and
+      // ends any orphan instead of starting inactive and orphaning it.
+      throw new CorruptSnapshotError('auto-dj state snapshot is corrupt', { cause: err });
     }
   }
 

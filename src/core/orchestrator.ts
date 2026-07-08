@@ -11,7 +11,7 @@ import type { Logger } from '../logger.js';
 import type { ArduinoCommandSink, DeviceStatusProvider } from '../ports.js';
 import type { FlowsheetClient } from '../backend/flowsheet-client.js';
 import type { AzuraCastSource } from '../azuracast/subscriber.js';
-import type { StateStore, Snapshot } from '../persistence/state-store.js';
+import { TransientReadError, type StateStore, type Snapshot } from '../persistence/state-store.js';
 import { epochHour } from '../time.js';
 import { reduce, type Effect, type Event, type ReduceResult } from './activation-state-machine.js';
 import { selectDeactivateResponse, selectStatus } from './selectors.js';
@@ -129,9 +129,22 @@ export class Orchestrator {
     try {
       snap = await this.deps.stateStore.load();
     } catch (err) {
-      // A corrupt snapshot: something was persisted but is unreadable, so a show
-      // may be on air with an id we can't recover. Probe BS and end any orphan,
-      // then settle INACTIVE — the same shape as an interrupted activation.
+      if (err instanceof TransientReadError) {
+        // A momentary read fault (a disk/mount/perms blip, e.g. mid-redeploy) is
+        // uncertainty, not confirmation — do NOT end a possibly-live show. Leave the
+        // on-disk state untouched; a later reconcile / the next boot retries the
+        // read. Ending here on a transient blip would be dead air where a retry
+        // would have re-attached.
+        this.deps.logger.warn(
+          { err },
+          'recovery: snapshot read transiently failed; leaving state for a later retry',
+        );
+        return;
+      }
+      // A corrupt (or unknown-fault) snapshot: something was persisted but is
+      // permanently unreadable, so a show may be on air with an id we can't recover.
+      // Probe BS and end any orphan, then settle INACTIVE — the same shape as an
+      // interrupted activation.
       this.deps.logger.error(
         { err },
         'recovery: state snapshot unreadable; probing BS for an orphan',
