@@ -398,12 +398,16 @@ export class Orchestrator {
       return true;
     }
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {
-      // Activation failed: revert to INACTIVE and pause the Arduino (the rest of
-      // the batch, which would have sent 'resume', is abandoned). The subscriber
-      // keeps running — it monitors AzuraCast continuously.
-      this.state = { ...initialState };
+      // join() threw — INDETERMINATE, not a clean failure: the request may have
+      // reached BS and created a show whose id we never learned (a dropped
+      // response). A durable ACTIVATING marker is ALREADY on disk (ACTIVATE_EFFECTS
+      // saveStrict'd it and gated join() on it), so recovery/reconcile can probe
+      // on-air and end any orphan without a show id. R2: do NOT reset to INACTIVE
+      // and do NOT persist — clobbering the marker with a clean INACTIVE makes
+      // recovery treat it as a clean shutdown and never probe, abandoning the
+      // orphan. Just pause the relay and abandon the batch (the trailing 'resume'
+      // is dropped); leave ACTIVATING in memory and on disk for the reconciler.
       this.deps.arduino.send('pause');
-      await this.deps.stateStore.save(snapshotOf(this.state));
       return true;
     }
     if (effect.type === 'END_SHOW' && this.state.phase === 'DEACTIVATING') {
