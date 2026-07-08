@@ -51,6 +51,17 @@ export class Orchestrator {
   private chain: Promise<unknown> = Promise.resolve();
   private ticker: NodeJS.Timeout | null = null;
   private readonly now: () => number;
+  /**
+   * Set when boot recovery read an ACTIVE snapshot but the first on-air probe
+   * returned off-air (item 8). We do NOT converge on a single off-air read — a BS
+   * false-negative in the eventual-consistency window right after a redeploy would
+   * durably mute a live show. Instead we pause defensively, hold the snapshot here,
+   * and let the reconciler re-probe: a second off-air read converges INACTIVE, an
+   * on-air read re-attaches (the false negative resolved). In-memory only — a crash
+   * mid-reconfirm re-reads the still-ACTIVE snapshot and simply restarts the two-read
+   * sequence, so it never needs persisting.
+   */
+  private reconfirmOffAir: Snapshot | null = null;
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.now = deps.now ?? Date.now;
@@ -127,6 +138,12 @@ export class Orchestrator {
    */
   reconcileTransitional(): Promise<void> {
     return this.enqueue(async () => {
+      // A boot ACTIVE-snapshot-but-off-air reconfirm (item 8) takes priority: it is
+      // armed while in-memory is INACTIVE, so it can't be found by the phase check.
+      if (this.reconfirmOffAir) {
+        await this.reconfirmActiveLiveness();
+        return;
+      }
       const phase = this.state.phase; // re-read inside the unit, not at call time
       if (phase === 'ACTIVATING' || phase === 'DEACTIVATING') {
         await this.endPossibleOrphanAndSettle();
@@ -214,11 +231,27 @@ export class Orchestrator {
       this.deps.logger.warn({ err }, 'recovery on-air probe failed; trusting the snapshot');
     }
     if (!onAir && !probeFailed) {
-      // The show ended out of band. Pause the relay and settle INACTIVE so a
-      // re-boot doesn't re-probe the same stale snapshot.
+      if (snap.phase === 'ACTIVE') {
+        // item 8: a single off-air read of a snapshot we believed ACTIVE is NOT
+        // confirmation — a BS false-negative post-redeploy would durably mute a live
+        // show. Do not settle. Pause defensively (if it really is off, no audio
+        // leaks; if it's a false negative, a one-tick pause is a far smaller harm
+        // than a durable INACTIVE mute), leave the ACTIVE snapshot untouched, and arm
+        // a reconfirm the reconciler re-probes on the next tick.
+        this.deps.arduino.send('pause');
+        this.reconfirmOffAir = snap;
+        this.deps.logger.warn(
+          { showId: snap.showId },
+          'recovery: snapshot ACTIVE but first probe off-air; reconfirming before converging',
+        );
+        return;
+      }
+      // DEACTIVATING + off-air: the operator was ending this show and it is confirmed
+      // off — converge. (No false-negative reconfirm here: the intended end state is
+      // off, so a momentary false-negative only reaches the state we were heading to.)
       this.deps.logger.info(
         { showId: snap.showId },
-        'snapshot was active but BS reports off-air; settling inactive',
+        'snapshot was deactivating and BS reports off-air; settling inactive',
       );
       await this.settleInactive();
       return;
@@ -247,28 +280,66 @@ export class Orchestrator {
       return;
     }
 
-    // phase ACTIVE: re-attach to the running show. Restore the persisted
-    // watermarks — lastBreakpointHour (so a restart mid-hour still posts that
-    // hour's breakpoint instead of skipping it) and lastPostedShId (so the
-    // subscriber's first poll doesn't re-post the still-playing track). Fall back
-    // to the current hour only if the snapshot predates breakpoint tracking.
-    await this.enqueue(() =>
-      this.applyEvent({
-        kind: 'RECOVERED',
-        showId: snap.showId!,
-        activatedBy: snap.activatedBy ?? {
-          source: 'virtual_switch',
-          detail: 'recovered',
-          at: this.nowIso(),
-        },
-        lastBreakpointHour: snap.lastBreakpointHour ?? epochHour(this.now()),
-        lastPostedShId: snap.lastPostedShId,
-      }),
-    );
-    // Re-assert the relay: a recovered live show must be routing Auto-DJ audio, but
-    // 'resume' is a one-shot command a crash (or a relay reset) may have missed.
+    // phase ACTIVE (on-air, or an indeterminate probe): re-attach to the running show.
+    await this.attachRecoveredShow(snap);
+  }
+
+  /**
+   * Re-attach to a running show after a restart (or after a reconfirm probe resolves
+   * on-air). Restores the persisted watermarks — lastBreakpointHour (so a restart
+   * mid-hour still posts that hour's breakpoint instead of skipping it) and
+   * lastPostedShId (so the subscriber's first poll doesn't re-post the still-playing
+   * track), falling back to the current hour only if the snapshot predates breakpoint
+   * tracking — then re-asserts the relay (a recovered live show must route Auto-DJ
+   * audio, but 'resume' is a one-shot a crash or relay reset may have missed).
+   *
+   * Dispatches via applyEvent directly (NOT enqueue): recover() runs off-chain as the
+   * sole writer at boot, and the reconfirm path already runs inside an enqueued unit —
+   * a nested enqueue would deadlock the chain.
+   */
+  private async attachRecoveredShow(snap: Snapshot): Promise<void> {
+    await this.applyEvent({
+      kind: 'RECOVERED',
+      showId: snap.showId!,
+      activatedBy: snap.activatedBy ?? {
+        source: 'virtual_switch',
+        detail: 'recovered',
+        at: this.nowIso(),
+      },
+      lastBreakpointHour: snap.lastBreakpointHour ?? epochHour(this.now()),
+      lastPostedShId: snap.lastPostedShId,
+    });
     this.deps.arduino.send('resume');
     this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
+  }
+
+  /**
+   * Second half of item 8's two-read confirmation, run on a reconcile tick while a
+   * reconfirm is armed. Re-probe: a second off-air read (now spanning >= one tick,
+   * past the eventual-consistency window) converges INACTIVE; an on-air read means the
+   * first probe was a false negative, so re-attach and resume; an indeterminate probe
+   * leaves the reconfirm armed for the next tick.
+   */
+  private async reconfirmActiveLiveness(): Promise<void> {
+    const snap = this.reconfirmOffAir;
+    if (!snap) return;
+    let onAir = false;
+    let probeFailed = false;
+    try {
+      onAir = await this.deps.flowsheet.isOnAir();
+    } catch (err) {
+      probeFailed = true;
+      this.deps.logger.warn({ err }, 'recovery: reconfirm probe failed; staying pending');
+    }
+    if (probeFailed) return; // still can't tell — retry next tick
+    this.reconfirmOffAir = null;
+    if (!onAir) {
+      this.deps.logger.info('recovery: ACTIVE snapshot confirmed off-air across two reads; settling inactive');
+      await this.settleInactive();
+      return;
+    }
+    this.deps.logger.info({ showId: snap.showId }, 'recovery: reconfirm read on-air (false negative); re-attaching');
+    await this.attachRecoveredShow(snap);
   }
 
   /**

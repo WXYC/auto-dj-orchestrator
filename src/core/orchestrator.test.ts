@@ -175,11 +175,50 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
 
-  it('stays inactive when the snapshot is active but BS reports off-air', async () => {
+  it('does NOT converge on a single off-air probe for an ACTIVE snapshot; a second off-air read converges', async () => {
     const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
-    const h = harness({ snapshot, isOnAir: false });
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValue(false); // both reads off-air
     await h.orchestrator.recover();
+    // item 8: one off-air read is not confirmation (a BS false-negative post-redeploy
+    // must not durably mute a live show). Pause defensively, arm a reconfirm, but do
+    // NOT settle — the snapshot stays ACTIVE, nothing is persisted yet.
+    expect(h.orchestrator.getStatus().active).toBe(false); // leaning off, unconfirmed
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
+    expect(h.stateStore.save).not.toHaveBeenCalled();
+    // A reconcile tick re-probes; a second off-air read (spanning >= one tick, past the
+    // eventual-consistency window) converges INACTIVE.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.isOnAir).toHaveBeenCalledTimes(2);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
     expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('re-attaches (false negative resolved) when the reconfirm probe reads on-air', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    await h.orchestrator.recover(); // first probe off -> arm reconfirm
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    h.arduino.send.mockClear();
+    await h.orchestrator.reconcileTransitional(); // second probe on -> re-attach
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    expect(h.orchestrator.getStatus().showId).toBe(789);
+    expect(h.arduino.send).toHaveBeenCalledWith('resume');
+  });
+
+  it('stays armed (no converge, no attach) when the reconfirm probe is indeterminate', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValueOnce(false).mockRejectedValueOnce(new Error('BS down'));
+    await h.orchestrator.recover();
+    await h.orchestrator.reconcileTransitional(); // probe throws -> stay pending
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).not.toBe('INACTIVE'); // NOT converged on an indeterminate re-probe
+    // A later tick that reads off-air finally converges.
+    h.flowsheet.isOnAir.mockResolvedValueOnce(false);
+    await h.orchestrator.reconcileTransitional();
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
   });
 
   it('re-attaches optimistically when the on-air probe throws (avoids orphaning a live show)', async () => {
