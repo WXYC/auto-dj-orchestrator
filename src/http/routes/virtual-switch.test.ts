@@ -21,7 +21,7 @@ import { virtualSwitchRouter } from './virtual-switch.js';
 import type { Orchestrator } from '../../core/orchestrator.js';
 import type { RejectionCode } from '../../core/activation-state-machine.js';
 import type { AuthUser, JwtVerifier } from '../jwks-verifier.js';
-import type { AutoDJDeactivateResponse } from '@wxyc/shared/auto-dj';
+import type { AutoDJDeactivateResponse, AutoDJStatus } from '@wxyc/shared/auto-dj';
 
 // A stateless fake verifier: a known token maps to a user, anything else throws
 // (the invalid-token path). A request with no/one-part Authorization header
@@ -31,6 +31,9 @@ const USERS: Record<string, AuthUser> = {
   'member-token': { id: 'u-mem', name: 'Angel Olsen', role: 'member' },
   // A role above 'dj', to prove the gate is hasRole(>=), not an exact-dj match.
   'md-token': { id: 'u-md', name: 'Jessica Pratt', role: 'musicDirector' },
+  // An authenticated token with no `role` claim, to prove GET /status fails
+  // closed (reduced payload) rather than defaulting a missing role to full (#21).
+  'norole-token': { id: 'u-nr', name: 'Cate Le Bon' },
 };
 const verifier: JwtVerifier = {
   async verify(token) {
@@ -46,14 +49,36 @@ const verifier: JwtVerifier = {
 // injection style of arduino-http.test.ts. mount() casts back to Orchestrator
 // at the boundary.
 type FakeOrchestrator = {
-  getStatus: () => { active: boolean; device: null };
+  getStatus: () => AutoDJStatus;
   activate: (by: { userId?: string; userName?: string }) => Promise<{ rejection?: RejectionCode }>;
   deactivate: () => Promise<{ rejection?: RejectionCode; failedEffect?: 'END_SHOW' }>;
   getDeactivateResponse: () => AutoDJDeactivateResponse;
 };
 
-/** An AutoDJStatus stub — only `active` is read by the router; `device` is unused. */
-const status = (active: boolean): { active: boolean; device: null } => ({ active, device: null });
+/** A minimal AutoDJStatus stub — `active` + a null device, no identity fields. */
+const status = (active: boolean): AutoDJStatus => ({ active, device: null });
+
+// Full status payloads carrying the identity/internal fields #21 gates:
+// activatedBy / lastDeactivatedBy (Better Auth userId + userName) and showId.
+const FULL_ACTIVE: AutoDJStatus = {
+  active: true,
+  activatedBy: { source: 'virtual_switch', userId: 'u-dj', userName: 'Nilüfer Yanya' },
+  activatedAt: '2026-07-07T00:00:00.000Z',
+  showId: 42,
+  currentTrack: {
+    artist: 'Juana Molina',
+    title: 'la paradoja',
+    album: 'DOGA',
+    detectedAt: '2026-07-07T00:00:00.000Z',
+  },
+  device: null,
+};
+const FULL_INACTIVE: AutoDJStatus = {
+  active: false,
+  lastDeactivatedAt: '2026-07-07T01:00:00.000Z',
+  lastDeactivatedBy: { source: 'virtual_switch', userId: 'u-dj', userName: 'Nilüfer Yanya' },
+  device: null,
+};
 
 let server: Server | undefined;
 
@@ -132,6 +157,65 @@ describe('virtual-switch router', () => {
       const url = await mount({ getStatus: vi.fn(() => status(true)) });
       const res = await send(url, 'GET', '/api/auto-dj/status', 'member-token');
       expect(res.status).toBe(200);
+    });
+
+    // #21: access is unchanged (all authenticated users still 200), but the
+    // payload detail is role-gated — `dj` and above see the full status,
+    // below-`dj` users get an identity-reduced projection (no activatedBy /
+    // lastDeactivatedBy / showId) in both the active and inactive branches.
+    describe('role-reduced payload (#21)', () => {
+      it('serves a dj the full active payload (activatedBy + showId present)', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_ACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'dj-token');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual(FULL_ACTIVE);
+      });
+
+      it('serves a dj the full inactive payload (lastDeactivatedBy present)', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_INACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'dj-token');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual(FULL_INACTIVE);
+      });
+
+      it('serves an above-dj musicDirector the full payload (gate is hasRole(>=), not exact dj)', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_ACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'md-token');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual(FULL_ACTIVE);
+      });
+
+      it('reduces the active payload for a member: drops activatedBy + showId, keeps the track', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_ACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'member-token');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+          active: true,
+          activatedAt: FULL_ACTIVE.activatedAt,
+          currentTrack: FULL_ACTIVE.currentTrack,
+          device: null,
+        });
+      });
+
+      it('reduces the inactive payload for a member: drops lastDeactivatedBy', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_INACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'member-token');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+          active: false,
+          lastDeactivatedAt: FULL_INACTIVE.lastDeactivatedAt,
+          device: null,
+        });
+      });
+
+      it('reduces the payload for an authenticated token with no role claim (fail-closed)', async () => {
+        const url = await mount({ getStatus: vi.fn(() => FULL_ACTIVE) });
+        const res = await send(url, 'GET', '/api/auto-dj/status', 'norole-token');
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body).not.toHaveProperty('activatedBy');
+        expect(body).not.toHaveProperty('showId');
+      });
     });
   });
 
