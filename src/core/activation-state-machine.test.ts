@@ -47,7 +47,7 @@ describe('reduce — activation', () => {
       userName: 'DJ Moonbeam',
       at: AT,
     });
-    expect(effectTypes(effects)).toEqual(['START_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
+    expect(effectTypes(effects)).toEqual(['PERSIST_STATE', 'START_SHOW', 'SEND_ARDUINO_COMMAND']);
   });
 
   it('SHOW_STARTED moves ACTIVATING -> ACTIVE and seeds the breakpoint hour', () => {
@@ -91,7 +91,7 @@ describe('reduce — deactivation', () => {
     expect(state.phase).toBe('DEACTIVATING');
     expect(state.lastDeactivatedBy).toEqual({ source: 'virtual_switch', at: AT });
     expect(state.activatedBy).toBeUndefined();
-    expect(effectTypes(effects)).toEqual(['END_SHOW', 'SEND_ARDUINO_COMMAND', 'PERSIST_STATE']);
+    expect(effectTypes(effects)).toEqual(['PERSIST_STATE', 'END_SHOW', 'SEND_ARDUINO_COMMAND']);
   });
 
   it('SHOW_ENDED moves DEACTIVATING -> INACTIVE and clears the show', () => {
@@ -162,19 +162,39 @@ describe('reduce — conflict resolution (§2.7)', () => {
 });
 
 describe('reduce — track posting + breakpoints', () => {
-  it('NOW_PLAYING while ACTIVE posts an entry and records the current track', () => {
+  it('NOW_PLAYING while ACTIVE posts an entry and records the current track (persist deferred to ENTRY_POSTED)', () => {
     const { state, effects } = reduce(activated(), {
       kind: 'NOW_PLAYING',
       track: track(1),
       at: AT,
     });
+    // No PERSIST_STATE here: the snapshot's dedupe key must only record an entry
+    // BS accepted, so PERSIST is emitted by ENTRY_POSTED after the post succeeds.
     expect(effects).toEqual([{ type: 'POST_ENTRY', track: track(1) }]);
+    expect(state.lastPostedShId).toBe(1); // advanced in memory for same-sh_id dedupe
     expect(state.currentTrack).toEqual({
       artist: 'Juana Molina',
       title: 'la paradoja',
       album: 'DOGA',
       detectedAt: AT,
     });
+  });
+
+  it('ENTRY_POSTED persists the advanced dedupe key only after a successful post', () => {
+    const posted = reduce(activated(), { kind: 'NOW_PLAYING', track: track(9), at: AT });
+    const confirmed = reduce(posted.state, { kind: 'ENTRY_POSTED', shId: 9 });
+    expect(confirmed.effects).toEqual([{ type: 'PERSIST_STATE' }]);
+    expect(confirmed.state.lastPostedShId).toBe(9);
+  });
+
+  it('ENTRY_POSTED is a no-op when not ACTIVE (a post confirmed after deactivation)', () => {
+    expect(reduce(initialState, { kind: 'ENTRY_POSTED', shId: 9 }).effects).toEqual([]);
+  });
+
+  it('ENTRY_POSTED does not persist when the dedupe key has already moved past the confirmed sh_id', () => {
+    const posted = reduce(activated(), { kind: 'NOW_PLAYING', track: track(10), at: AT });
+    // A late confirmation for an earlier entry (sh_id 9) must not force a persist.
+    expect(reduce(posted.state, { kind: 'ENTRY_POSTED', shId: 9 }).effects).toEqual([]);
   });
 
   it('dedupes consecutive NOW_PLAYING with the same sh_id (no double opening entry)', () => {
@@ -236,10 +256,12 @@ describe('reduce — restart recovery', () => {
       showId: 789,
       activatedBy: { source: 'virtual_switch', userId: 'u1', at: AT },
       epochHour: 100,
+      lastPostedShId: 555,
     });
     expect(state.phase).toBe('ACTIVE');
     expect(state.showId).toBe(789);
     expect(state.lastBreakpointHour).toBe(100);
+    expect(state.lastPostedShId).toBe(555); // restored so the still-playing track isn't re-posted
     expect(effectTypes(effects)).toEqual(['PERSIST_STATE']);
     expect(effectTypes(effects)).not.toContain('START_SHOW');
   });

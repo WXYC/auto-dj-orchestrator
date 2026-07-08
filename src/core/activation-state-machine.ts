@@ -30,8 +30,15 @@ export type Event =
   | { kind: 'SHOW_STARTED'; showId: number; epochHour: number }
   | { kind: 'SHOW_ENDED' }
   | { kind: 'HOUR_TICK'; epochHour: number }
+  | { kind: 'ENTRY_POSTED'; shId: number }
   | { kind: 'BREAKPOINT_POSTED'; epochHour: number }
-  | { kind: 'RECOVERED'; showId: number; activatedBy: Activation; epochHour: number };
+  | {
+      kind: 'RECOVERED';
+      showId: number;
+      activatedBy: Activation;
+      epochHour: number;
+      lastPostedShId?: number;
+    };
 
 export type Effect =
   | { type: 'START_SHOW' }
@@ -61,18 +68,26 @@ const reject = (state: ActivationState, rejection: RejectionCode): ReduceResult 
 // keeps the live-DJ (is_live) signal current even while auto-DJ is inactive, so
 // `liveDj` can clear when a live DJ leaves.
 
+// PERSIST_STATE comes FIRST so the transitional intent (ACTIVATING / DEACTIVATING)
+// is durable before the killable network call: SHOW_STARTED / SHOW_ENDED overwrite
+// it with the terminal phase on success, but a crash in between leaves the
+// transitional phase on disk for recover() to clean up (an orphaned show start, or
+// an interrupted teardown). With PERSIST last, only {ACTIVE, INACTIVE} ever reached
+// disk, so a crash mid-deactivate re-attached (resurrected) the show and a crash
+// mid-activate left an orphan BS show that recovery never probed.
+
 /** Effects emitted when auto-DJ turns on. */
 const ACTIVATE_EFFECTS: Effect[] = [
+  { type: 'PERSIST_STATE' },
   { type: 'START_SHOW' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'resume' },
-  { type: 'PERSIST_STATE' },
 ];
 
 /** Effects emitted when auto-DJ turns off. */
 const DEACTIVATE_EFFECTS: Effect[] = [
+  { type: 'PERSIST_STATE' },
   { type: 'END_SHOW' },
   { type: 'SEND_ARDUINO_COMMAND', action: 'pause' },
-  { type: 'PERSIST_STATE' },
 ];
 
 function activate(state: ActivationState, activatedBy: Activation): ReduceResult {
@@ -152,6 +167,12 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
         if (state.lastPostedShId === event.track.shId) {
           return { state: { ...state, currentTrack: detected }, effects: [] };
         }
+        // Advance lastPostedShId in memory now so a same-sh_id callback that
+        // races in during the post is deduped, but do NOT persist here: the
+        // snapshot's dedupe key must only ever record a track that BS actually
+        // accepted. If addEntry() fails, PERSIST is skipped (see ENTRY_POSTED),
+        // so a restart re-attempts the entry instead of the snapshot claiming a
+        // never-posted track as already posted and dropping it forever.
         return {
           state: { ...state, currentTrack: detected, lastPostedShId: event.track.shId },
           effects: [{ type: 'POST_ENTRY', track: event.track }],
@@ -203,6 +224,20 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
       return { state, effects: [{ type: 'POST_BREAKPOINT', epochHour: event.epochHour }] };
     }
 
+    case 'ENTRY_POSTED': {
+      // The coordinator dispatches this only after flowsheet.addEntry() succeeds.
+      // NOW_PLAYING already advanced lastPostedShId in memory (for same-sh_id
+      // dedupe); persisting here — and only here — keeps the durable dedupe key
+      // limited to entries BS actually accepted, so a crashed post is retried
+      // after a restart rather than silently dropped. Persist only if the
+      // confirmed sh_id is still the current dedupe key, so a late confirmation
+      // can't durably record a key the live state has already moved past.
+      if (state.phase !== 'ACTIVE' || state.lastPostedShId !== event.shId) {
+        return { state, effects: [] };
+      }
+      return { state, effects: [{ type: 'PERSIST_STATE' }] };
+    }
+
     case 'BREAKPOINT_POSTED': {
       if (state.phase !== 'ACTIVE') return { state, effects: [] };
       if (state.lastBreakpointHour !== undefined && event.epochHour <= state.lastBreakpointHour) {
@@ -222,7 +257,7 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           activatedBy: event.activatedBy,
           lastBreakpointHour: event.epochHour,
           currentTrack: null,
-          lastPostedShId: undefined,
+          lastPostedShId: event.lastPostedShId,
         },
         effects: [{ type: 'PERSIST_STATE' }],
       };

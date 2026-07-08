@@ -34,6 +34,7 @@ const snapshotOf = (s: ActivationState): Snapshot => ({
   showId: s.showId,
   activatedBy: s.activatedBy,
   lastBreakpointHour: s.lastBreakpointHour,
+  lastPostedShId: s.lastPostedShId,
 });
 
 /**
@@ -111,7 +112,9 @@ export class Orchestrator {
   /** Start the hourly-breakpoint ticker. Idempotent. */
   start(): void {
     if (this.ticker) return;
-    this.ticker = setInterval(() => void this.hourTick(), this.deps.tickIntervalMs ?? 60_000);
+    this.ticker = setInterval(() => {
+      void this.hourTick().catch((err) => this.deps.logger.error({ err }, 'hour tick failed'));
+    }, this.deps.tickIntervalMs ?? 60_000);
   }
 
   stop(): void {
@@ -122,12 +125,41 @@ export class Orchestrator {
 
   /** Boot recovery: re-attach to an in-progress show only if BS confirms it is on air. */
   async recover(): Promise<void> {
-    const snap = await this.deps.stateStore.load();
-    if (!snap || snap.showId === undefined) return;
+    let snap: Snapshot | null;
+    try {
+      snap = await this.deps.stateStore.load();
+    } catch (err) {
+      // A corrupt snapshot: something was persisted but is unreadable, so a show
+      // may be on air with an id we can't recover. Probe BS and end any orphan,
+      // then settle INACTIVE — the same shape as an interrupted activation.
+      this.deps.logger.error(
+        { err },
+        'recovery: state snapshot unreadable; probing BS for an orphan',
+      );
+      await this.endPossibleOrphanAndSettle();
+      return;
+    }
+    if (!snap) return; // first boot, or a clean shutdown left no snapshot
+
+    // ACTIVATING: activation was interrupted before we learned the show id, so
+    // flowsheet.join() may or may not have created a show in BS. Probe and tear
+    // down any orphan, then settle INACTIVE — activation was never confirmed, so
+    // we never auto-resurrect; a human must re-activate.
+    if (snap.phase === 'ACTIVATING') {
+      await this.endPossibleOrphanAndSettle();
+      return;
+    }
+
+    // Only ACTIVE / DEACTIVATING carry a show to re-attach to or finish.
     if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return;
+    if (snap.showId === undefined) {
+      // Malformed (ACTIVE/DEACTIVATING with no id): treat like an unknown show.
+      await this.endPossibleOrphanAndSettle();
+      return;
+    }
 
     // Distinguish "definitely off-air" (probe returned false) from "couldn't
-    // tell" (probe threw — transient auth/BS error). A definitive off-air starts
+    // tell" (probe threw — transient auth/BS error). A definitive off-air settles
     // INACTIVE; an indeterminate probe trusts the snapshot and re-attaches, so a
     // routine redeploy during a transient BS blip doesn't orphan a live show
     // (which then couldn't be ended via the API).
@@ -140,19 +172,32 @@ export class Orchestrator {
       this.deps.logger.warn({ err }, 'recovery on-air probe failed; trusting the snapshot');
     }
     if (!onAir && !probeFailed) {
-      this.deps.logger.info('snapshot was active but BS reports off-air; starting inactive');
+      // The show ended out of band. Pause the relay and settle INACTIVE so a
+      // re-boot doesn't re-probe the same stale snapshot.
+      this.deps.logger.info(
+        { showId: snap.showId },
+        'snapshot was active but BS reports off-air; settling inactive',
+      );
+      await this.settleInactive();
       return;
     }
 
     if (snap.phase === 'DEACTIVATING') {
-      // A teardown was in progress when we died — finish it, do NOT re-activate
-      // (that would resurrect a show the operator was turning off, possibly on
-      // top of a live DJ).
+      // A teardown was in progress when we died — finish it, then settle INACTIVE.
+      // Only converge if end() actually succeeded: otherwise the show may still be
+      // live in BS and persisting INACTIVE would stop the next boot from re-probing
+      // (a permanent orphan). Leave the DEACTIVATING snapshot so recovery retries.
+      // Do NOT re-activate (that would resurrect a show the operator was ending).
       try {
         await this.deps.flowsheet.end();
       } catch (err) {
-        this.deps.logger.warn({ err }, 'recovery: failed to finish interrupted deactivation');
+        this.deps.logger.warn(
+          { err },
+          'recovery: failed to finish interrupted deactivation; leaving it for the next boot to retry',
+        );
+        return;
       }
+      await this.settleInactive();
       this.deps.logger.info(
         { showId: snap.showId },
         'finished an interrupted deactivation on recovery',
@@ -160,7 +205,8 @@ export class Orchestrator {
       return;
     }
 
-    // phase ACTIVE: re-attach to the running show.
+    // phase ACTIVE: re-attach to the running show. Restore lastPostedShId so the
+    // subscriber's first poll doesn't re-post the still-playing track.
     await this.enqueue(() =>
       this.applyEvent({
         kind: 'RECOVERED',
@@ -171,9 +217,71 @@ export class Orchestrator {
           at: this.nowIso(),
         },
         epochHour: epochHour(this.now()),
+        lastPostedShId: snap.lastPostedShId,
       }),
     );
+    // Re-assert the relay: a recovered live show must be routing Auto-DJ audio, but
+    // 'resume' is a one-shot command a crash (or a relay reset) may have missed.
+    this.deps.arduino.send('resume');
     this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
+  }
+
+  /**
+   * Probe BS for a show we cannot manage (an interrupted activation left no show
+   * id, or the snapshot is unreadable) and end any orphan. Converge to INACTIVE
+   * only when the Auto-DJ is provably off — a successful end() or a definitive
+   * off-air probe. end() fires only on a POSITIVE probe (ending on an indeterminate
+   * probe with no show id could tear down a live human DJ's show; on-air/end are
+   * dj-scoped to the Auto-DJ account, WXYC/Backend-Service#1530). An indeterminate
+   * probe or a failed end() leaves the snapshot so the next boot retries — never
+   * persisting INACTIVE over an orphan we could not confirm gone.
+   */
+  private async endPossibleOrphanAndSettle(): Promise<void> {
+    let onAir = false;
+    try {
+      onAir = await this.deps.flowsheet.isOnAir();
+    } catch (err) {
+      this.deps.logger.warn(
+        { err },
+        'recovery: on-air probe failed with no show id; leaving it for the next boot to retry',
+      );
+      return;
+    }
+    if (!onAir) {
+      // No orphan on air — nothing to end, safe to converge.
+      this.deps.logger.info('recovery: no orphaned auto-dj show on air; starting inactive');
+      await this.settleInactive();
+      return;
+    }
+    // A confirmed orphan: only converge if we actually end it, else leave the
+    // snapshot so the next boot re-probes and retries rather than abandoning it.
+    try {
+      await this.deps.flowsheet.end();
+    } catch (err) {
+      this.deps.logger.warn(
+        { err },
+        'recovery: failed to end orphaned show; leaving it for the next boot to retry',
+      );
+      return;
+    }
+    this.deps.logger.info('recovery: ended an orphaned auto-dj show');
+    await this.settleInactive();
+  }
+
+  /**
+   * Reset in-memory state to INACTIVE and durably record it so recovery converges
+   * — a re-boot then reads INACTIVE and re-runs nothing. Best-effort: if the
+   * persist fails, the next boot just re-runs the idempotent cleanup.
+   */
+  private async settleInactive(): Promise<void> {
+    this.state = { ...initialState };
+    // INACTIVE means auto-DJ is off, so the relay must not be left routing Auto-DJ
+    // audio to air (it may still be in 'resume' from a prior activation). Every
+    // convergence path funnels through here, so the pause is issued once and
+    // consistently — including the end-an-orphan path, which otherwise ended the
+    // BS show but left the relay live.
+    this.deps.arduino.send('pause');
+    await this.deps.stateStore.save(snapshotOf(this.state));
   }
 
   // ── Internals ──────────────────────────────────────────────────────────
@@ -225,6 +333,10 @@ export class Orchestrator {
       case 'START_SHOW': {
         const showId = await this.deps.flowsheet.join();
         await this.applyEvent({ kind: 'SHOW_STARTED', showId, epochHour: epochHour(this.now()) });
+        // SHOW_STARTED's persist is best-effort; re-persist the ACTIVE+showId marker
+        // so a single dropped write can't leave ACTIVATING on disk, which recovery
+        // would treat as an orphan to END — tearing down this healthy live show.
+        await this.deps.stateStore.save(snapshotOf(this.state));
         // Post the currently-playing track as the show's opening entry (the
         // subscriber runs continuously, so no NOW_PLAYING arrives just for
         // having activated).
@@ -241,6 +353,10 @@ export class Orchestrator {
       }
       case 'POST_ENTRY':
         await this.deps.flowsheet.addEntry(effect.track);
+        // Persist the advanced dedupe key only after BS accepts the entry, so a
+        // failed post isn't durably recorded as "already posted" (which would
+        // drop the track across a restart).
+        await this.applyEvent({ kind: 'ENTRY_POSTED', shId: effect.track.shId });
         break;
       case 'POST_BREAKPOINT':
         await this.deps.flowsheet.addBreakpoint();
@@ -251,7 +367,14 @@ export class Orchestrator {
         this.deps.arduino.send(effect.action);
         break;
       case 'PERSIST_STATE':
-        await this.deps.stateStore.save(snapshotOf(this.state));
+        if (this.state.phase === 'ACTIVATING') {
+          // The activation-intent marker gates flowsheet.join(): if it can't be
+          // made durable, don't create a BS show we couldn't recover. A failure
+          // throws -> handleEffectFailure rolls back and abandons the batch.
+          await this.deps.stateStore.saveStrict(snapshotOf(this.state));
+        } else {
+          await this.deps.stateStore.save(snapshotOf(this.state));
+        }
         break;
     }
   }
@@ -262,6 +385,15 @@ export class Orchestrator {
    * rollback (so runEffects abandons the rest of the batch).
    */
   private async handleEffectFailure(effect: Effect): Promise<boolean> {
+    if (effect.type === 'PERSIST_STATE' && this.state.phase === 'ACTIVATING') {
+      // The activation-intent persist failed. Abort before START_SHOW/join() so
+      // we never create a BS show with no durable marker to recover it: revert to
+      // INACTIVE and pause, abandoning the rest of the batch.
+      this.deps.logger.warn('activation-intent persist failed; aborting activation');
+      this.state = { ...initialState };
+      this.deps.arduino.send('pause');
+      return true;
+    }
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {
       // Activation failed: revert to INACTIVE and pause the Arduino (the rest of
       // the batch, which would have sent 'resume', is abandoned). The subscriber
