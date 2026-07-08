@@ -29,6 +29,10 @@ The Arduino is a "dumb" relay/button reporter: it reports relay state and button
 | **Arduino management**     | Accept heartbeats, relay state, and button presses from the Arduino; dispatch commands. WebSocket (primary) + HTTP fallback.                |
 | **Conflict resolution**    | Auto-deactivate when a live DJ starts a show; no auto-reactivation; detect orphaned shows on restart.                                       |
 
+### Flowsheet posting guarantee
+
+Now-playing entries are posted to Backend-Service **at least once**: the orchestrator advances its durable dedupe key (the last-posted AzuraCast `sh_id`) only _after_ BS accepts an entry, so a failed post is retried on the next tick rather than being recorded as sent and dropped. The guarantee is therefore **no dropped entries**, at the cost of a narrow crash window — if `addEntry()` succeeds in BS but the process dies before the dedupe-key persist, the restart re-posts that one track. So: at-least-once, with **at most one duplicate on an ill-timed crash**, never a drop. Reaching true exactly-once needs a client-supplied idempotency key that BS deduplicates on, tracked in [WXYC/Backend-Service#1545](https://github.com/WXYC/Backend-Service/issues/1545).
+
 ## Specification
 
 The full networking specification lives in the [auto-dj-arduino-switch](https://github.com/WXYC/auto-dj-arduino-switch) repo:
