@@ -807,6 +807,40 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
     expect(h.arduino.send).toHaveBeenCalledWith('resume'); // re-attach resumes the relay
   });
 
+  it('does not re-attach over a live DJ when a recoveryPending tick re-runs recover()', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot, isOnAir: true });
+    h.stateStore.load.mockRejectedValueOnce(new TransientReadError('EIO')); // boot transient -> pending
+    await h.orchestrator.recover();
+    // A live DJ takes the relay during the pending window. At INACTIVE this only sets
+    // liveDj (no phase change), so recoveryPending survives.
+    await h.orchestrator.relayState(true);
+    h.arduino.send.mockClear();
+    // The tick re-runs recover(); load() now succeeds and the probe reads on-air, but a
+    // live DJ is present — recover()'s re-attach must yield (it runs the boot re-attach
+    // path, which at a real boot never sees a live DJ but on a tick re-run can).
+    await h.orchestrator.reconcileTransitional();
+    expect(h.orchestrator.getStatus().active).toBe(false); // did not re-attach
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume'); // did not route over the DJ
+  });
+
+  it('drops a pending boot recovery once the operator activates (no stale re-run over the live show)', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot, isOnAir: true });
+    h.stateStore.load.mockRejectedValueOnce(new TransientReadError('EIO')); // boot read transient
+    await h.orchestrator.recover(); // recoveryPending set, in-memory INACTIVE
+    // The operator activates a fresh show during the pending window.
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.orchestrator.getStatus().showId).toBe(701);
+    h.stateStore.load.mockClear();
+    // The reconcile tick must NOT re-run recover() over the live operator show: the
+    // pending recovery was superseded when the machine left INACTIVE.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.stateStore.load).not.toHaveBeenCalled(); // no stale recover() re-load
+    expect(h.orchestrator.getStatus().showId).toBe(701); // live show untouched
+    expect(h.orchestrator.getStatus().activatedBy?.userId).toBe('u1');
+  });
+
   it('does not re-attach over a live DJ when the reconfirm probe reads on-air', async () => {
     const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
     const h = harness({ snapshot });
