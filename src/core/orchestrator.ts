@@ -52,14 +52,15 @@ export class Orchestrator {
   private ticker: NodeJS.Timeout | null = null;
   private readonly now: () => number;
   /**
-   * Set when boot recovery read an ACTIVE snapshot but the first on-air probe
-   * returned off-air (item 8). We do NOT converge on a single off-air read — a BS
-   * false-negative in the eventual-consistency window right after a redeploy would
-   * durably mute a live show. Instead we pause defensively, hold the snapshot here,
-   * and let the reconciler re-probe: a second off-air read converges INACTIVE, an
-   * on-air read re-attaches (the false negative resolved). In-memory only — a crash
-   * mid-reconfirm re-reads the still-ACTIVE snapshot and simply restarts the two-read
-   * sequence, so it never needs persisting.
+   * Set when boot recovery read a transitional-terminal snapshot (ACTIVE or
+   * DEACTIVATING) whose first on-air probe returned off-air (item 8). We do NOT converge
+   * on a single off-air read — a BS false-negative in the eventual-consistency window
+   * right after a redeploy would durably mute a live ACTIVE show or orphan a still-live
+   * DEACTIVATING one. Instead we pause defensively, hold the snapshot here, and let the
+   * reconciler re-probe: a second off-air read converges INACTIVE; an on-air read acts
+   * by the snapshot's phase (re-attach an ACTIVE show, end() a DEACTIVATING one). In
+   * memory only — a crash mid-reconfirm re-reads the still-transitional snapshot and
+   * simply restarts the two-read sequence, so it never needs persisting.
    */
   private reconfirmOffAir: Snapshot | null = null;
   /**
@@ -168,7 +169,7 @@ export class Orchestrator {
       // inside the enqueued unit and drop a stale reconfirm rather than acting on it.
       if (this.reconfirmOffAir) {
         if (this.state.phase === 'INACTIVE') {
-          await this.reconfirmActiveLiveness();
+          await this.reconfirmLiveness();
           return;
         }
         this.reconfirmOffAir = null; // stale — the machine moved on; fall through
@@ -274,29 +275,21 @@ export class Orchestrator {
       this.deps.logger.warn({ err }, 'recovery on-air probe failed; trusting the snapshot');
     }
     if (!onAir && !probeFailed) {
-      if (snap.phase === 'ACTIVE') {
-        // item 8: a single off-air read of a snapshot we believed ACTIVE is NOT
-        // confirmation — a BS false-negative post-redeploy would durably mute a live
-        // show. Do not settle. Pause defensively (if it really is off, no audio
-        // leaks; if it's a false negative, a one-tick pause is a far smaller harm
-        // than a durable INACTIVE mute), leave the ACTIVE snapshot untouched, and arm
-        // a reconfirm the reconciler re-probes on the next tick.
-        this.deps.arduino.send('pause');
-        this.reconfirmOffAir = snap;
-        this.deps.logger.warn(
-          { showId: snap.showId },
-          'recovery: snapshot ACTIVE but first probe off-air; reconfirming before converging',
-        );
-        return { needsResume: false };
-      }
-      // DEACTIVATING + off-air: the operator was ending this show and it is confirmed
-      // off — converge. (No false-negative reconfirm here: the intended end state is
-      // off, so a momentary false-negative only reaches the state we were heading to.)
-      this.deps.logger.info(
-        { showId: snap.showId },
-        'snapshot was deactivating and BS reports off-air; settling inactive',
+      // item 8: a single off-air read is NOT confirmation for EITHER transitional-boot
+      // phase — a BS false-negative post-redeploy could durably mute a live ACTIVE show
+      // OR orphan a still-live DEACTIVATING one (its teardown may have failed pre-restart
+      // and the show is still broadcasting). Do not settle/end on the first read. Pause
+      // defensively (if it really is off, no audio leaks; if it's a false negative, a
+      // one-tick pause is a far smaller harm than a durable mute/orphan), leave the
+      // snapshot untouched, and arm a two-read reconfirm the reconciler re-probes on the
+      // next tick — where the on-air action is phase-appropriate (re-attach an ACTIVE
+      // show; end() a DEACTIVATING one).
+      this.deps.arduino.send('pause');
+      this.reconfirmOffAir = snap;
+      this.deps.logger.warn(
+        { showId: snap.showId, phase: snap.phase },
+        'recovery: snapshot off-air on first probe; reconfirming before converging',
       );
-      await this.settleInactive();
       return { needsResume: false };
     }
 
@@ -331,7 +324,7 @@ export class Orchestrator {
     // started), but recover() also runs on a reconcile tick while recoveryPending — and
     // there the subscriber is live and a DJ may have taken the relay (a RELAY_STATE at
     // INACTIVE sets liveDj without changing phase). Do NOT re-attach Auto-DJ over a live
-    // DJ (symmetric with reconfirmActiveLiveness's guard); leave it INACTIVE, no resume.
+    // DJ (symmetric with reconfirmLiveness's guard); leave it INACTIVE, no resume.
     if (this.state.liveDj) {
       this.deps.logger.info(
         { showId: snap.showId },
@@ -390,12 +383,15 @@ export class Orchestrator {
 
   /**
    * Second half of item 8's two-read confirmation, run on a reconcile tick while a
-   * reconfirm is armed. Re-probe: a second off-air read (now spanning >= one tick,
-   * past the eventual-consistency window) converges INACTIVE; an on-air read means the
-   * first probe was a false negative, so re-attach and resume; an indeterminate probe
-   * leaves the reconfirm armed for the next tick.
+   * reconfirm is armed (for an ACTIVE or DEACTIVATING boot snapshot that read off-air
+   * once). Re-probe: a second off-air read (now spanning >= one tick, past the
+   * eventual-consistency window) converges INACTIVE for either phase; an indeterminate
+   * probe leaves the reconfirm armed for the next tick. On an on-air read (the first
+   * probe was a false negative) the action is phase-appropriate: an ACTIVE snapshot
+   * re-attaches (unless a live DJ took over), a DEACTIVATING one retries end() — the
+   * operator wanted it off, so a still-live show must be ended, not re-attached.
    */
-  private async reconfirmActiveLiveness(): Promise<void> {
+  private async reconfirmLiveness(): Promise<void> {
     const snap = this.reconfirmOffAir;
     if (!snap) return;
     let onAir = false;
@@ -410,7 +406,27 @@ export class Orchestrator {
     this.reconfirmOffAir = null;
     if (!onAir) {
       this.deps.logger.info(
-        'recovery: ACTIVE snapshot confirmed off-air across two reads; settling inactive',
+        'recovery: snapshot confirmed off-air across two reads; settling inactive',
+      );
+      await this.settleInactive();
+      return;
+    }
+    if (snap.phase === 'DEACTIVATING') {
+      // The teardown target is still live (false negative resolved) — end() it and
+      // converge only on success, else leave it for the tick to retry.
+      try {
+        await this.deps.flowsheet.end();
+      } catch (err) {
+        this.recoveryPending = true;
+        this.deps.logger.warn(
+          { err, showId: snap.showId },
+          'recovery: reconfirm found the deactivating show still live; end() failed, will retry',
+        );
+        return;
+      }
+      this.deps.logger.info(
+        { showId: snap.showId },
+        'recovery: reconfirm found the deactivating show still live; ended it',
       );
       await this.settleInactive();
       return;
@@ -479,7 +495,17 @@ export class Orchestrator {
    * persist fails, the next boot just re-runs the idempotent cleanup.
    */
   private async settleInactive(): Promise<void> {
-    this.state = { ...initialState };
+    // Match the inline SHOW_ENDED reducer path (which spreads ...state): keep the
+    // "current external reality" fields — who last deactivated (attribution) and the
+    // live-DJ signal — while clearing the show-specific fields. Otherwise a
+    // reconciler-driven convergence forgets that e.g. a live DJ (source 'relay') ended
+    // the show (getStatus/getDeactivateResponse would then default to 'virtual_switch'),
+    // and a still-present live DJ would be wrongly cleared to liveDj:false.
+    this.state = {
+      ...initialState,
+      lastDeactivatedBy: this.state.lastDeactivatedBy,
+      liveDj: this.state.liveDj,
+    };
     // INACTIVE means auto-DJ is off, so the relay must not be left routing Auto-DJ
     // audio to air (it may still be in 'resume' from a prior activation). Every
     // convergence path funnels through here, so the pause is issued once and
