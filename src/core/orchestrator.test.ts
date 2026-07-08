@@ -390,14 +390,40 @@ describe('Orchestrator — opening entry + breakpoint retry', () => {
 });
 
 describe('Orchestrator — failure handling', () => {
-  it('rolls back to INACTIVE and pauses the Arduino when the show start fails', async () => {
+  it('stays ACTIVATING (preserving the durable intent) when the show start fails', async () => {
     const h = harness();
+    h.stateStore.save.mockClear();
     h.flowsheet.join.mockRejectedValueOnce(new Error('BS down'));
     await h.orchestrator.activate({ userId: 'u1' });
-    expect(h.orchestrator.getStatus().active).toBe(false);
-    // The rest of the activate batch is abandoned: no 'resume', and a pause is sent.
+    // item 2 (R2): join() is indeterminate — BS may have created a show whose id we
+    // never learned. The durable ACTIVATING marker (saveStrict'd before join()) must
+    // be LEFT ALONE so recovery probes on-air and ends any orphan; clobbering it
+    // with a clean INACTIVE makes recovery skip the probe and abandon the orphan.
+    expect(h.orchestrator.getStatus().active).toBe(true); // ACTIVATING counts as on-air
+    // No best-effort persist after join() throws — the ACTIVATING marker persisted
+    // (strictly) before join() is preserved, never overwritten with INACTIVE.
+    expect(h.stateStore.save).not.toHaveBeenCalled();
+    // The batch is abandoned: pause, never resume.
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
+  });
+
+  it('leaves the ACTIVATING marker for recovery when join() created a show but dropped the response', async () => {
+    const h = harness({ isOnAir: true });
+    // join() reaches BS and creates a show, but the response is lost, so it throws —
+    // a show now exists with an id we never learned.
+    h.flowsheet.join.mockRejectedValueOnce(new Error('response dropped after BS created a show'));
+    await h.orchestrator.activate({ userId: 'u1' });
+    // The durable ACTIVATING marker is preserved (not clobbered to INACTIVE), so a
+    // subsequent recover()/reconcile probes on-air and ends the orphan. showId is
+    // never set (we never learned it) — orphan cleanup is showId-free (dj-scoped end).
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    expect(h.orchestrator.getStatus().showId).toBeUndefined();
+    const savedPhases = [...h.stateStore.saveStrict.mock.calls, ...h.stateStore.save.mock.calls].map(
+      (c) => (c[0] as Snapshot).phase,
+    );
+    expect(savedPhases).not.toContain('INACTIVE');
+    expect(savedPhases).toContain('ACTIVATING');
   });
 
   it('stays DEACTIVATING (does not orphan) when flowsheet.end() fails, still surfacing the outcome', async () => {
