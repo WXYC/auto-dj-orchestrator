@@ -327,6 +327,18 @@ export class Orchestrator {
     }
 
     // phase ACTIVE (on-air, or an indeterminate probe): re-attach to the running show.
+    // Live-DJ-wins guard: at genuine boot liveDj is always false (the subscriber hasn't
+    // started), but recover() also runs on a reconcile tick while recoveryPending — and
+    // there the subscriber is live and a DJ may have taken the relay (a RELAY_STATE at
+    // INACTIVE sets liveDj without changing phase). Do NOT re-attach Auto-DJ over a live
+    // DJ (symmetric with reconfirmActiveLiveness's guard); leave it INACTIVE, no resume.
+    if (this.state.liveDj) {
+      this.deps.logger.info(
+        { showId: snap.showId },
+        'recovery: a live DJ is present; not re-attaching (live DJ wins)',
+      );
+      return { needsResume: false };
+    }
     // Defer the relay resume to the caller (item 9) — it fires after the subscriber
     // starts so a live DJ can preempt.
     await this.attachRecoveredShow(snap, { sendResume: false });
@@ -496,14 +508,17 @@ export class Orchestrator {
     const result = reduce(this.state, event);
     if (result.rejection) return result;
     this.state = result.state;
-    // A boot reconfirm (item 8) is armed only while INACTIVE and is meaningful only
-    // until the machine establishes a new ground truth. The instant any event moves it
-    // out of INACTIVE (a fresh activation), that reconfirm — armed for a possibly-
-    // defunct boot show — is stale; drop it so a later tick that finds phase back at
-    // INACTIVE can't re-attach the dead snapshot. (The reconfirm's own re-attach clears
-    // the flag before dispatching RECOVERED, so this is a no-op on that path.)
-    if (this.reconfirmOffAir && this.state.phase !== 'INACTIVE') {
+    // Boot-recovery bookkeeping (reconfirmOffAir for item 8, recoveryPending for the
+    // transient/unconverged retry) is meaningful only until the machine establishes a
+    // new ground truth. The instant any event moves it out of INACTIVE (a fresh
+    // activation), both are stale — the operator/system has superseded whatever boot
+    // snapshot they referenced — so drop them. Otherwise a later tick could re-run
+    // recover() (re-reading an old disk snapshot) or re-attach a defunct reconfirm over
+    // the live show. (The reconfirm's own re-attach clears its flag before dispatching
+    // RECOVERED, so this is a no-op on that path.)
+    if (this.state.phase !== 'INACTIVE') {
       this.reconfirmOffAir = null;
+      this.recoveryPending = false;
     }
     const failedEffect = await this.runEffects(result.effects);
     return failedEffect ? { ...result, failedEffect } : result;
