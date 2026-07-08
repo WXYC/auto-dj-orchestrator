@@ -235,7 +235,8 @@ export class Orchestrator {
         { err },
         'recovery: state snapshot unreadable; probing BS for an orphan',
       );
-      await this.endPossibleOrphanAndSettle();
+      // If it couldn't converge (indeterminate probe / failed end), retry on the tick.
+      if (!(await this.endPossibleOrphanAndSettle())) this.recoveryPending = true;
       return { needsResume: false };
     }
     if (!snap) return { needsResume: false }; // first boot, or a clean shutdown left no snapshot
@@ -243,9 +244,11 @@ export class Orchestrator {
     // ACTIVATING: activation was interrupted before we learned the show id, so
     // flowsheet.join() may or may not have created a show in BS. Probe and tear
     // down any orphan, then settle INACTIVE — activation was never confirmed, so
-    // we never auto-resurrect; a human must re-activate.
+    // we never auto-resurrect; a human must re-activate. If the probe/end couldn't
+    // converge, mark recovery pending so the tick re-runs recover() (in-memory is
+    // INACTIVE, which the transitional-phase reconciler would otherwise skip).
     if (snap.phase === 'ACTIVATING') {
-      await this.endPossibleOrphanAndSettle();
+      if (!(await this.endPossibleOrphanAndSettle())) this.recoveryPending = true;
       return { needsResume: false };
     }
 
@@ -253,7 +256,7 @@ export class Orchestrator {
     if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return { needsResume: false };
     if (snap.showId === undefined) {
       // Malformed (ACTIVE/DEACTIVATING with no id): treat like an unknown show.
-      await this.endPossibleOrphanAndSettle();
+      if (!(await this.endPossibleOrphanAndSettle())) this.recoveryPending = true;
       return { needsResume: false };
     }
 
@@ -306,9 +309,12 @@ export class Orchestrator {
       try {
         await this.deps.flowsheet.end();
       } catch (err) {
+        // The show may still be live; leave DEACTIVATING and retry on the tick
+        // (recover() re-runs while recoveryPending, re-probing and re-attempting end).
+        this.recoveryPending = true;
         this.deps.logger.warn(
           { err },
-          'recovery: failed to finish interrupted deactivation; leaving it for the next boot to retry',
+          'recovery: failed to finish interrupted deactivation; will retry on the next reconcile tick',
         );
         return { needsResume: false };
       }
@@ -422,39 +428,37 @@ export class Orchestrator {
    * off-air probe. end() fires only on a POSITIVE probe (ending on an indeterminate
    * probe with no show id could tear down a live human DJ's show; on-air/end are
    * dj-scoped to the Auto-DJ account, WXYC/Backend-Service#1530). An indeterminate
-   * probe or a failed end() leaves the snapshot so the next boot retries — never
-   * persisting INACTIVE over an orphan we could not confirm gone.
+   * probe or a failed end() leaves the snapshot so recovery retries — never persisting
+   * INACTIVE over an orphan we could not confirm gone. Returns `true` when it converged
+   * (settled INACTIVE) and `false` when it left the phase for a retry, so the boot caller
+   * can mark recovery pending (the in-memory-keyed tick reconciler would otherwise never
+   * revisit a boot-recovered phase that stays in-memory INACTIVE).
    */
-  private async endPossibleOrphanAndSettle(): Promise<void> {
+  private async endPossibleOrphanAndSettle(): Promise<boolean> {
     let onAir = false;
     try {
       onAir = await this.deps.flowsheet.isOnAir();
     } catch (err) {
-      this.deps.logger.warn(
-        { err },
-        'recovery: on-air probe failed with no show id; leaving it for the next boot to retry',
-      );
-      return;
+      this.deps.logger.warn({ err }, 'recovery: on-air probe failed with no show id; will retry');
+      return false;
     }
     if (!onAir) {
       // No orphan on air — nothing to end, safe to converge.
       this.deps.logger.info('recovery: no orphaned auto-dj show on air; starting inactive');
       await this.settleInactive();
-      return;
+      return true;
     }
     // A confirmed orphan: only converge if we actually end it, else leave the
-    // snapshot so the next boot re-probes and retries rather than abandoning it.
+    // snapshot so recovery re-probes and retries rather than abandoning it.
     try {
       await this.deps.flowsheet.end();
     } catch (err) {
-      this.deps.logger.warn(
-        { err },
-        'recovery: failed to end orphaned show; leaving it for the next boot to retry',
-      );
-      return;
+      this.deps.logger.warn({ err }, 'recovery: failed to end orphaned show; will retry');
+      return false;
     }
     this.deps.logger.info('recovery: ended an orphaned auto-dj show');
     await this.settleInactive();
+    return true;
   }
 
   /**
