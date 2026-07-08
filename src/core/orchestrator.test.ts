@@ -400,18 +400,26 @@ describe('Orchestrator — failure handling', () => {
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
 
-  it('surfaces the teardown outcome when flowsheet.end() fails, still converging to INACTIVE', async () => {
+  it('stays DEACTIVATING (does not orphan) when flowsheet.end() fails, still surfacing the outcome', async () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1' });
+    h.stateStore.save.mockClear();
     h.flowsheet.end.mockRejectedValueOnce(new Error('BS down'));
     const result = await h.orchestrator.deactivate();
-    // Option A (#15): the machine still converges to INACTIVE ("better INACTIVE
-    // than stuck deactivating"), but the failed teardown is reported so the
-    // router can answer 502 instead of a misleading 200. The BS show is left
-    // orphaned — retrying it is option B, out of scope here.
+    // item 1 (R2): end() threw, so the show is STILL LIVE in BS. SHOW_ENDED is not
+    // dispatched — the phase stays DEACTIVATING durably, the reconciler (item 4)
+    // retries end() and converges only when the probe confirms off-air. The failed
+    // teardown is still reported so the router answers 502 (unchanged from #20).
     expect(result.failedEffect).toBe('END_SHOW');
-    expect(h.orchestrator.getStatus().active).toBe(false);
+    // item 6: DEACTIVATING counts as on-air, so status reads "teardown pending",
+    // not a lie that the (still-live) show is off.
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    // The relay is paused regardless (safe hardware state), but the snapshot must
+    // NOT be INACTIVE — a durable INACTIVE over a live show is the orphan bug.
     expect(h.arduino.send).toHaveBeenCalledWith('pause');
+    const savedPhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(savedPhases).not.toContain('INACTIVE');
+    expect(savedPhases).toContain('DEACTIVATING');
   });
 
   it('reports no failedEffect on a clean deactivation', async () => {

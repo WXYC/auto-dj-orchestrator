@@ -62,7 +62,18 @@ export const initialState: ActivationState = {
   liveDj: false,
 };
 
-/** True when auto-DJ is on the air (or in the brief activating/deactivating windows it is treated as "on"). */
+/**
+ * True when auto-DJ is on the air. Both transitional phases count as "on": a show
+ * is live in BS from the moment ACTIVATING commits until a teardown is *confirmed*
+ * off-air, so DEACTIVATING must read "on the air, teardown pending" — a failed
+ * teardown durably stays DEACTIVATING (R1/R2), and every status consumer (dj-site
+ * greyscale, etc.) would otherwise see "off" over a show that is still broadcasting.
+ * The 502-vs-200 distinction on /deactivate rides `failedEffect`, not this.
+ */
 export function isActive(state: ActivationState): boolean {
-  return state.phase === 'ACTIVE' || state.phase === 'ACTIVATING';
+  return (
+    state.phase === 'ACTIVE' ||
+    state.phase === 'ACTIVATING' ||
+    state.phase === 'DEACTIVATING'
+  );
 }

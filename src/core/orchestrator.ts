@@ -407,10 +407,17 @@ export class Orchestrator {
       return true;
     }
     if (effect.type === 'END_SHOW' && this.state.phase === 'DEACTIVATING') {
-      // Treat as ended; better INACTIVE than stuck deactivating. Finish the
-      // cleanup the aborted batch would have done.
+      // end() threw, so the show is STILL LIVE in BS — we have NO confirmation it
+      // is off. Do NOT dispatch SHOW_ENDED: that would converge INACTIVE and
+      // persist it over a live show, and because in-memory state would then be
+      // INACTIVE nothing retries — a permanent orphan during normal operation
+      // (the exact bug recover() was fixed to avoid, in the in-process path). R2:
+      // restore safe hardware state (pause the relay) but leave the phase
+      // DEACTIVATING durable and abandon the batch. reconcile() (the periodic
+      // driver, item 4) retries end() and converges only when the probe confirms
+      // off-air. Returning true still surfaces failedEffect === 'END_SHOW' so the
+      // router answers 502 (unchanged from #20).
       this.deps.arduino.send('pause');
-      await this.applyEvent({ kind: 'SHOW_ENDED' });
       return true;
     }
     return false; // POST_ENTRY / POST_BREAKPOINT / etc: logged, continue.
