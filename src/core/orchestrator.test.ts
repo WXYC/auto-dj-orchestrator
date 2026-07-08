@@ -2,7 +2,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { Orchestrator } from './orchestrator.js';
 import type { FlowsheetClient } from '../backend/flowsheet-client.js';
 import type { AzuraCastSource } from '../azuracast/subscriber.js';
-import type { StateStore, Snapshot } from '../persistence/state-store.js';
+import {
+  CorruptSnapshotError,
+  TransientReadError,
+  type StateStore,
+  type Snapshot,
+} from '../persistence/state-store.js';
 import type { ArduinoCommandSink } from '../ports.js';
 import type { NowPlaying } from './state.js';
 
@@ -273,7 +278,7 @@ describe('Orchestrator — restart recovery', () => {
 
   it('ends an orphan and settles inactive when the snapshot is corrupt (a show may be on air)', async () => {
     const h = harness({ isOnAir: true });
-    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    h.stateStore.load.mockRejectedValueOnce(new CorruptSnapshotError('corrupt snapshot'));
     await h.orchestrator.recover();
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // corrupt != "no snapshot": probe + end
     expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay must not be left live
@@ -283,11 +288,23 @@ describe('Orchestrator — restart recovery', () => {
 
   it('settles inactive without ending anything when a corrupt snapshot has no show on air', async () => {
     const h = harness({ isOnAir: false });
-    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    h.stateStore.load.mockRejectedValueOnce(new CorruptSnapshotError('corrupt snapshot'));
     await h.orchestrator.recover();
     expect(h.flowsheet.end).not.toHaveBeenCalled();
     expect(h.orchestrator.getStatus().active).toBe(false);
     expect(lastSavedPhase(h)).toBe('INACTIVE');
+  });
+
+  it('does NOT end a live show when the snapshot read is a transient fault (item 7)', async () => {
+    const h = harness({ isOnAir: true });
+    // A retriable read fault (e.g. a redeploy-time disk/mount blip), not corruption.
+    h.stateStore.load.mockRejectedValueOnce(new TransientReadError('EIO'));
+    await h.orchestrator.recover();
+    // Uncertainty, not confirmation: leave the on-disk state and retry later. Ending
+    // here would be dead air on a show a retry would have re-attached.
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    expect(h.stateStore.save).not.toHaveBeenCalled(); // no settle, snapshot untouched
+    expect(h.arduino.send).not.toHaveBeenCalledWith('pause');
   });
 
   it('does not end blind or converge when an interrupted-activation probe is indeterminate', async () => {
