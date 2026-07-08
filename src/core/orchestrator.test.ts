@@ -42,6 +42,9 @@ function harness(opts?: {
     save: vi.fn(async (s: Snapshot) => {
       saved = s;
     }),
+    saveStrict: vi.fn(async (s: Snapshot) => {
+      saved = s;
+    }),
   };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const orchestrator = new Orchestrator({
@@ -133,6 +136,7 @@ describe('Orchestrator — restart recovery', () => {
     expect(status.active).toBe(true);
     expect(status.showId).toBe(789);
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // no duplicate join
+    expect(h.arduino.send).toHaveBeenCalledWith('resume'); // relay re-asserted on re-attach
   });
 
   it('stays inactive when the snapshot is active but BS reports off-air', async () => {
@@ -158,6 +162,171 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.orchestrator.getStatus().active).toBe(false);
     expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // teardown finished
     expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT re-activated
+  });
+
+  it('does not re-post the still-playing track after re-attaching on restart', async () => {
+    const snapshot: Snapshot = {
+      phase: 'ACTIVE',
+      showId: 789,
+      lastBreakpointHour: 100,
+      lastPostedShId: 555, // the track playing (and already posted) before the restart
+    };
+    const h = harness({ snapshot, isOnAir: true });
+    await h.orchestrator.recover();
+    await h.orchestrator.onTrack(track(555)); // subscriber's first poll: same song still playing
+    expect(h.flowsheet.addEntry).not.toHaveBeenCalled(); // dedupe key survived the restart
+    await h.orchestrator.onTrack(track(556)); // a genuinely new track still posts
+    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(556));
+  });
+
+  it('does not durably record a failed entry as posted, so the track is retried after a restart', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' });
+    const persistedShId = () => {
+      const calls = h.stateStore.save.mock.calls;
+      return (calls[calls.length - 1]![0] as Snapshot).lastPostedShId;
+    };
+    const beforeShId = persistedShId();
+
+    // A genuinely new track fails to post to BS.
+    h.flowsheet.addEntry.mockRejectedValueOnce(new Error('BS 500'));
+    await h.orchestrator.onTrack(track(900));
+    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(900));
+    // The snapshot must NOT claim sh_id 900 as posted — otherwise a restart would
+    // dedupe it and drop the never-posted track forever.
+    expect(persistedShId()).toBe(beforeShId);
+    expect(persistedShId()).not.toBe(900);
+
+    // The next track posts and IS durably recorded.
+    await h.orchestrator.onTrack(track(901));
+    expect(h.flowsheet.addEntry).toHaveBeenCalledWith(track(901));
+    expect(persistedShId()).toBe(901);
+  });
+
+  it('ends an orphaned show and stays inactive when an interrupted activation is recovered', async () => {
+    // Crashed mid-join: ACTIVATING persisted, but the show id was never learned.
+    const snapshot: Snapshot = { phase: 'ACTIVATING' };
+    const h = harness({ snapshot, isOnAir: true }); // BS reports on-air => our join created an orphan
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan torn down
+    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay paused after teardown
+    expect(h.flowsheet.join).not.toHaveBeenCalled(); // NOT auto-resurrected
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('stays inactive without ending anything when an interrupted activation created no show', async () => {
+    const snapshot: Snapshot = { phase: 'ACTIVATING' };
+    const h = harness({ snapshot, isOnAir: false }); // join never reached BS
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('persists the transitional phase before the network call so a crash mid-flight is recoverable', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' });
+    // ACTIVATING is persisted via the strict (gating) save before flowsheet.join().
+    const activatePhases = h.stateStore.saveStrict.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(activatePhases).toContain('ACTIVATING');
+    await h.orchestrator.deactivate();
+    const deactivatePhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(deactivatePhases).toContain('DEACTIVATING'); // durable before flowsheet.end()
+  });
+
+  const lastSavedPhase = (h: ReturnType<typeof harness>) =>
+    (h.stateStore.save.mock.calls.at(-1)?.[0] as Snapshot | undefined)?.phase;
+
+  it('ends an orphan and settles inactive when the snapshot is corrupt (a show may be on air)', async () => {
+    const h = harness({ isOnAir: true });
+    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // corrupt != "no snapshot": probe + end
+    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay must not be left live
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).toBe('INACTIVE'); // converged
+  });
+
+  it('settles inactive without ending anything when a corrupt snapshot has no show on air', async () => {
+    const h = harness({ isOnAir: false });
+    h.stateStore.load.mockRejectedValueOnce(new Error('corrupt snapshot'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
+  });
+
+  it('does not end blind or converge when an interrupted-activation probe is indeterminate', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' } });
+    h.flowsheet.isOnAir.mockRejectedValue(new Error('transient BS error')); // stays down
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).not.toHaveBeenCalled(); // ending blind could hit a human DJ's show
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    // Must NOT persist INACTIVE — that would abandon a possible orphan and stop the
+    // next boot from re-probing. The ACTIVATING snapshot is left for retry.
+    expect(h.stateStore.save).not.toHaveBeenCalled();
+    await h.orchestrator.recover(); // re-probes on the next boot
+    expect(h.flowsheet.isOnAir).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not converge when an interrupted deactivation cannot end the show (retries next boot)', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    h.flowsheet.end.mockRejectedValue(new Error('BS down'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    // end() failed -> the show may still be live -> must NOT durably record INACTIVE.
+    const settled = h.stateStore.save.mock.calls.some(
+      (c) => (c[0] as Snapshot).phase === 'INACTIVE',
+    );
+    expect(settled).toBe(false);
+    await h.orchestrator.recover(); // DEACTIVATING snapshot survived -> retries end()
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not converge when ending a confirmed orphan fails (retries next boot)', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' }, isOnAir: true });
+    h.flowsheet.end.mockRejectedValue(new Error('BS down'));
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // positive probe -> tried to end
+    const settled = h.stateStore.save.mock.calls.some(
+      (c) => (c[0] as Snapshot).phase === 'INACTIVE',
+    );
+    expect(settled).toBe(false);
+    await h.orchestrator.recover(); // ACTIVATING snapshot survived -> re-probes + retries
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(2);
+  });
+
+  it('pauses the relay and settles inactive when finishing an interrupted deactivation', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(h.arduino.send).toHaveBeenCalledWith('pause'); // relay was left in 'resume'
+    expect(lastSavedPhase(h)).toBe('INACTIVE'); // converged
+  });
+
+  it('recovery is terminal: a second recover() after an interrupted deactivation does not re-end', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    await h.orchestrator.recover(); // snapshot is now INACTIVE; must be a no-op
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // not re-ended every boot
+  });
+
+  it('interrupted-activation recovery settles inactive so a second recover() does not re-end', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' }, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(lastSavedPhase(h)).toBe('INACTIVE');
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // idempotent-terminal
+  });
+
+  it('does not create a BS show when the activation-intent persist fails', async () => {
+    const h = harness();
+    h.stateStore.saveStrict.mockRejectedValueOnce(new Error('disk full'));
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.flowsheet.join).not.toHaveBeenCalled(); // gated: no durable intent -> no join
+    expect(h.orchestrator.getStatus().active).toBe(false); // rolled back
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
   });
 });
 
