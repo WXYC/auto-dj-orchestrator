@@ -324,12 +324,14 @@ export class Orchestrator {
     // started), but recover() also runs on a reconcile tick while recoveryPending — and
     // there the subscriber is live and a DJ may have taken the relay (a RELAY_STATE at
     // INACTIVE sets liveDj without changing phase). Do NOT re-attach Auto-DJ over a live
-    // DJ (symmetric with reconfirmLiveness's guard); leave it INACTIVE, no resume.
+    // DJ, and do NOT abandon the orphan either: end the Auto-DJ show (dj-scoped, so the
+    // live DJ is untouched) and converge, so nothing is stranded.
     if (this.state.liveDj) {
       this.deps.logger.info(
         { showId: snap.showId },
-        'recovery: a live DJ is present; not re-attaching (live DJ wins)',
+        'recovery: a live DJ is present; ending the orphan instead of re-attaching',
       );
+      await this.endOrphanThenSettle();
       return { needsResume: false };
     }
     // Defer the relay resume to the caller (item 9) — it fires after the subscriber
@@ -411,35 +413,17 @@ export class Orchestrator {
       await this.settleInactive();
       return;
     }
-    if (snap.phase === 'DEACTIVATING') {
-      // The teardown target is still live (false negative resolved) — end() it and
-      // converge only on success, else leave it for the tick to retry.
-      try {
-        await this.deps.flowsheet.end();
-      } catch (err) {
-        this.recoveryPending = true;
-        this.deps.logger.warn(
-          { err, showId: snap.showId },
-          'recovery: reconfirm found the deactivating show still live; end() failed, will retry',
-        );
-        return;
-      }
+    // On-air (the first probe was a false negative). The show must be ENDED, not
+    // re-attached, in two cases: a DEACTIVATING snapshot (the operator wanted it off),
+    // or a live DJ has since taken the relay (live-DJ-wins — a live-DJ signal at INACTIVE
+    // only sets liveDj, no phase change). Either way the still-live Auto-DJ show must be
+    // cleaned up (dj-scoped end), not abandoned or routed over the DJ.
+    if (snap.phase === 'DEACTIVATING' || this.state.liveDj) {
       this.deps.logger.info(
-        { showId: snap.showId },
-        'recovery: reconfirm found the deactivating show still live; ended it',
+        { showId: snap.showId, liveDj: this.state.liveDj },
+        'recovery: reconfirm read on-air; ending the orphaned auto-dj show instead of re-attaching',
       );
-      await this.settleInactive();
-      return;
-    }
-    if (this.state.liveDj) {
-      // The probe reads on-air but a live DJ took the relay during the reconfirm
-      // window (a live-DJ signal at INACTIVE only sets liveDj, no phase change).
-      // Live-DJ-wins: do NOT re-attach Auto-DJ over them. The relay is already paused
-      // (from arming), and there is no auto-reactivation — a human must re-activate.
-      this.deps.logger.info(
-        { showId: snap.showId },
-        'recovery: reconfirm read on-air but a live DJ is present; not re-attaching (live DJ wins)',
-      );
+      await this.endOrphanThenSettle();
       return;
     }
     this.deps.logger.info(
@@ -513,6 +497,30 @@ export class Orchestrator {
     // BS show but left the relay live.
     this.deps.arduino.send('pause');
     await this.deps.stateStore.save(snapshotOf(this.state));
+  }
+
+  /**
+   * End the Auto-DJ orphan then settle INACTIVE. Used when recovery must NOT re-attach
+   * but the show is still live and must be cleaned up rather than abandoned: a
+   * DEACTIVATING teardown the operator wanted off, or an ACTIVE show over which a live
+   * DJ has since taken the relay. end() is dj-scoped to the Auto-DJ account, so it tears
+   * down only the Auto-DJ show, never the live human DJ's. Converge only on a successful
+   * end(); otherwise mark recovery pending so the tick retries (leaving the show stranded
+   * — in-memory INACTIVE over a live BS show with nothing to reconcile it — is the exact
+   * orphan class this redesign forbids).
+   */
+  private async endOrphanThenSettle(): Promise<void> {
+    try {
+      await this.deps.flowsheet.end();
+    } catch (err) {
+      this.recoveryPending = true;
+      this.deps.logger.warn(
+        { err },
+        'recovery: failed to end the orphaned show; will retry on the next tick',
+      );
+      return;
+    }
+    await this.settleInactive();
   }
 
   // ── Internals ──────────────────────────────────────────────────────────

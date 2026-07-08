@@ -861,11 +861,13 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
     await h.orchestrator.relayState(true);
     h.arduino.send.mockClear();
     // The tick re-runs recover(); load() now succeeds and the probe reads on-air, but a
-    // live DJ is present — recover()'s re-attach must yield (it runs the boot re-attach
-    // path, which at a real boot never sees a live DJ but on a tick re-run can).
+    // live DJ is present. recover() must NOT re-attach over them — and must NOT abandon
+    // the orphaned Auto-DJ show either: it ends the orphan (dj-scoped, so the live DJ is
+    // untouched) and converges INACTIVE, so nothing is stranded.
     await h.orchestrator.reconcileTransitional();
     expect(h.orchestrator.getStatus().active).toBe(false); // did not re-attach
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume'); // did not route over the DJ
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan ended, not stranded
   });
 
   it('drops a pending boot recovery once the operator activates (no stale re-run over the live show)', async () => {
@@ -894,11 +896,13 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
     // only records liveDj (no phase change), so the reconfirm stays armed.
     await h.orchestrator.relayState(true);
     // The reconfirm probe reads on-air (the old Auto-DJ show is still marked live in
-    // BS), but a live DJ is present — live-DJ-wins, so do NOT re-attach or resume.
+    // BS), but a live DJ is present — live-DJ-wins, so do NOT re-attach or resume. The
+    // still-live Auto-DJ orphan must be ended (dj-scoped) and converged, not stranded.
     h.flowsheet.isOnAir.mockResolvedValueOnce(true);
     h.arduino.send.mockClear();
     await h.orchestrator.reconcileTransitional();
     expect(h.orchestrator.getStatus().active).toBe(false); // did not re-attach
     expect(h.arduino.send).not.toHaveBeenCalledWith('resume'); // did not route Auto-DJ over the DJ
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan ended, not stranded
   });
 });
