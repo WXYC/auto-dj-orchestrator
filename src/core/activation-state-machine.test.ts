@@ -209,7 +209,7 @@ describe('reduce — track posting + breakpoints', () => {
     ]);
   });
 
-  it('records a track during ACTIVATING for status without posting; SHOW_STARTED just persists', () => {
+  it('records a track during ACTIVATING for status without posting; SHOW_STARTED emits no effect', () => {
     const activating = reduce(initialState, {
       kind: 'ACTIVATE_REQUESTED',
       source: 'virtual_switch',
@@ -219,7 +219,10 @@ describe('reduce — track posting + breakpoints', () => {
     expect(buffered.state.currentTrack?.title).toBe('la paradoja');
     expect(buffered.effects).toEqual([]); // no post while still ACTIVATING
     const started = reduce(buffered.state, { kind: 'SHOW_STARTED', showId: 1, epochHour: 100 });
-    expect(effectTypes(started.effects)).toEqual(['PERSIST_STATE']);
+    // SHOW_STARTED emits NO PERSIST_STATE (item 3): the orchestrator owns the single
+    // post-join saveStrict, so the ACTIVATING -> ACTIVE transition reaches disk
+    // through exactly one strict write, never a best-effort one that could drop.
+    expect(started.effects).toEqual([]);
   });
 
   it('HOUR_TICK emits a breakpoint but only advances the hour on BREAKPOINT_POSTED (retry-safe)', () => {

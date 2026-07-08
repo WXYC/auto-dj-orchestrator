@@ -213,8 +213,12 @@ describe('Orchestrator — restart recovery', () => {
   it('does not durably record a failed entry as posted, so the track is retried after a restart', async () => {
     const h = harness();
     await h.orchestrator.activate({ userId: 'u1' });
+    // Entry dedupe-key persists are best-effort `save` (ENTRY_POSTED); the initial
+    // ACTIVE marker now lands via saveStrict (item 3), so before any entry posts
+    // there is no best-effort save yet — the durable dedupe key is simply undefined.
     const persistedShId = () => {
       const calls = h.stateStore.save.mock.calls;
+      if (calls.length === 0) return undefined;
       return (calls[calls.length - 1]![0] as Snapshot).lastPostedShId;
     };
     const beforeShId = persistedShId();
@@ -454,5 +458,55 @@ describe('Orchestrator — failure handling', () => {
     const result = await h.orchestrator.deactivate();
     expect(result.failedEffect).toBeUndefined();
     expect(h.orchestrator.getStatus().active).toBe(false);
+  });
+
+  it('reaches ACTIVE through a single strict persist; no best-effort write ever puts ACTIVE on disk', async () => {
+    const h = harness();
+    await h.orchestrator.activate({ userId: 'u1' });
+    // item 3: the ACTIVATING intent and the ACTIVE confirmation are the ONLY strict
+    // persists, in that order. If ACTIVATING-on-disk always means "no confirmed
+    // show", the reconciler can safely end an orphan without risking a healthy show.
+    const strictPhases = h.stateStore.saveStrict.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(strictPhases).toEqual(['ACTIVATING', 'ACTIVE']);
+    // No best-effort save writes ACTIVE (SHOW_STARTED emits no PERSIST_STATE), so a
+    // single dropped best-effort write can't leave ACTIVATING on disk under ACTIVE.
+    const bestEffortPhases = h.stateStore.save.mock.calls.map((c) => (c[0] as Snapshot).phase);
+    expect(bestEffortPhases).not.toContain('ACTIVE');
+  });
+
+  it('rolls back through teardown when the post-join ACTIVE persist fails, converging INACTIVE on a good end()', async () => {
+    const h = harness();
+    // ACTIVATING intent persists fine; the post-join ACTIVE saveStrict throws.
+    h.stateStore.saveStrict
+      .mockImplementationOnce(async () => {}) // ACTIVATING intent: ok
+      .mockImplementationOnce(async () => {
+        throw new Error('disk full'); // ACTIVE confirmation: fails
+      });
+    await h.orchestrator.activate({ userId: 'u1' });
+    // Memory reached ACTIVE (SHOW_STARTED ran) but disk is still ACTIVATING — a split
+    // brain. It is closed by re-entering the unified teardown path: end() reconciles
+    // BS, and a good end() converges INACTIVE.
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    // The activate batch's trailing 'resume' must NOT fire — the batch is abandoned,
+    // not carried on into SEND_ARDUINO_COMMAND (the regression if the rollback
+    // dispatch isn't wired as its own handleEffectFailure branch).
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
+  });
+
+  it('leaves the show DEACTIVATING when the post-join ACTIVE persist fails and end() also fails', async () => {
+    const h = harness();
+    h.stateStore.saveStrict
+      .mockImplementationOnce(async () => {})
+      .mockImplementationOnce(async () => {
+        throw new Error('disk full');
+      });
+    h.flowsheet.end.mockRejectedValueOnce(new Error('BS down'));
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1);
+    // end() failed too: stay DEACTIVATING (active:true) for the reconciler to retry;
+    // never a clean INACTIVE over a possibly-live show.
+    expect(h.orchestrator.getStatus().active).toBe(true);
+    expect(h.arduino.send).not.toHaveBeenCalledWith('resume');
   });
 });
