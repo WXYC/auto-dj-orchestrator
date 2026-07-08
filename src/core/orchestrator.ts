@@ -62,6 +62,13 @@ export class Orchestrator {
    * sequence, so it never needs persisting.
    */
   private reconfirmOffAir: Snapshot | null = null;
+  /**
+   * Set when boot recovery's snapshot read failed transiently (item 7): the read is
+   * left for a retry rather than ending a possibly-live show. The periodic reconciler
+   * re-runs recover() while this is set, so the retry actually happens in-process on
+   * the next tick — not only on the next full restart.
+   */
+  private recoveryPending = false;
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.now = deps.now ?? Date.now;
@@ -76,7 +83,12 @@ export class Orchestrator {
   }
 
   // ── External entry points (serialized) ─────────────────────────────────
-  activate(by: { userId?: string; userName?: string }): Promise<ReduceResult> {
+  // Returns AppliedResult (not bare ReduceResult) so the /activate route can tell a
+  // failed activation from a clean one via `failedEffect` — it can NOT use
+  // getStatus().active, because a failed START_SHOW leaves phase ACTIVATING and a
+  // failed post-join persist rolls to DEACTIVATING, both of which isActive() counts
+  // as on-air (so `active` is true for a failed activation). Symmetric with deactivate().
+  activate(by: { userId?: string; userName?: string }): Promise<AppliedResult> {
     return this.enqueue(() =>
       this.applyEvent({
         kind: 'ACTIVATE_REQUESTED',
@@ -138,6 +150,15 @@ export class Orchestrator {
    */
   reconcileTransitional(): Promise<void> {
     return this.enqueue(async () => {
+      // A boot snapshot read that failed transiently (item 7) is retried here, in
+      // process, rather than waiting for the next restart. recover() does not enqueue
+      // (it dispatches via applyEvent), so running it inside this enqueued unit is safe;
+      // the subscriber is already live, so a re-attach can resume the relay immediately.
+      if (this.recoveryPending) {
+        const { needsResume } = await this.recover();
+        if (needsResume) this.resumeRecoveredShow();
+        return;
+      }
       // A boot ACTIVE-snapshot-but-off-air reconfirm (item 8) takes priority — but ONLY
       // while the machine is still in the INACTIVE state it was armed in. If a normal
       // activation (or any phase change) intervened during the reconfirm window, the
@@ -187,6 +208,7 @@ export class Orchestrator {
    * invariant (writes before anything enqueues) holds regardless of the deferred resume.
    */
   async recover(): Promise<{ needsResume: boolean }> {
+    this.recoveryPending = false; // re-armed below only if the read is transient
     let snap: Snapshot | null;
     try {
       snap = await this.deps.stateStore.load();
@@ -194,12 +216,14 @@ export class Orchestrator {
       if (err instanceof TransientReadError) {
         // A momentary read fault (a disk/mount/perms blip, e.g. mid-redeploy) is
         // uncertainty, not confirmation — do NOT end a possibly-live show. Leave the
-        // on-disk state untouched; a later reconcile / the next boot retries the
-        // read. Ending here on a transient blip would be dead air where a retry
-        // would have re-attached.
+        // on-disk state untouched and mark recovery pending: the periodic reconciler
+        // re-runs recover() on the next tick, so the read is retried IN-PROCESS (not
+        // only on the next restart). Ending here on a transient blip would be dead
+        // air where a retry would have re-attached.
+        this.recoveryPending = true;
         this.deps.logger.warn(
           { err },
-          'recovery: snapshot read transiently failed; leaving state for a later retry',
+          'recovery: snapshot read transiently failed; will retry on the next reconcile tick',
         );
         return { needsResume: false };
       }
@@ -373,6 +397,17 @@ export class Orchestrator {
       await this.settleInactive();
       return;
     }
+    if (this.state.liveDj) {
+      // The probe reads on-air but a live DJ took the relay during the reconfirm
+      // window (a live-DJ signal at INACTIVE only sets liveDj, no phase change).
+      // Live-DJ-wins: do NOT re-attach Auto-DJ over them. The relay is already paused
+      // (from arming), and there is no auto-reactivation — a human must re-activate.
+      this.deps.logger.info(
+        { showId: snap.showId },
+        'recovery: reconfirm read on-air but a live DJ is present; not re-attaching (live DJ wins)',
+      );
+      return;
+    }
     this.deps.logger.info(
       { showId: snap.showId },
       'recovery: reconfirm read on-air (false negative); re-attaching',
@@ -457,6 +492,15 @@ export class Orchestrator {
     const result = reduce(this.state, event);
     if (result.rejection) return result;
     this.state = result.state;
+    // A boot reconfirm (item 8) is armed only while INACTIVE and is meaningful only
+    // until the machine establishes a new ground truth. The instant any event moves it
+    // out of INACTIVE (a fresh activation), that reconfirm — armed for a possibly-
+    // defunct boot show — is stale; drop it so a later tick that finds phase back at
+    // INACTIVE can't re-attach the dead snapshot. (The reconfirm's own re-attach clears
+    // the flag before dispatching RECOVERED, so this is a no-op on that path.)
+    if (this.reconfirmOffAir && this.state.phase !== 'INACTIVE') {
+      this.reconfirmOffAir = null;
+    }
     const failedEffect = await this.runEffects(result.effects);
     return failedEffect ? { ...result, failedEffect } : result;
   }

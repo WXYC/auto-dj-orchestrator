@@ -55,7 +55,10 @@ const verifier: JwtVerifier = {
 // at the boundary.
 type FakeOrchestrator = {
   getStatus: () => AutoDJStatus;
-  activate: (by: { userId?: string; userName?: string }) => Promise<{ rejection?: RejectionCode }>;
+  activate: (by: {
+    userId?: string;
+    userName?: string;
+  }) => Promise<{ rejection?: RejectionCode; failedEffect?: 'START_SHOW' | 'PERSIST_STATE' }>;
   deactivate: () => Promise<{ rejection?: RejectionCode; failedEffect?: 'END_SHOW' }>;
   getDeactivateResponse: () => AutoDJDeactivateResponse;
 };
@@ -285,19 +288,27 @@ describe('virtual-switch router', () => {
       });
     });
 
-    it('returns 502 when the reducer accepted but the downstream effect left it inactive', async () => {
-      // activate() resolves with no rejection, yet the show-start effect failed
-      // and rolled the state back — getStatus() still reports inactive.
+    it('returns 502 when the activation effect failed — keying off failedEffect, not active', async () => {
+      // A failed join() leaves phase ACTIVATING and a failed post-join persist rolls
+      // to DEACTIVATING; isActive() counts both as on-air, so getStatus().active is
+      // TRUE for a failed activation. The 502 must key off the reported failedEffect,
+      // NOT active — otherwise a failed activation returns a misleading 200.
       const url = await mount({
-        activate: vi.fn(async () => ({})),
-        getStatus: vi.fn(() => status(false)),
+        activate: vi.fn(async () => ({ failedEffect: 'START_SHOW' as const })),
+        getStatus: vi.fn(() => status(true)), // ACTIVATING reads active:true
       });
       const res = await send(url, 'POST', '/api/auto-dj/activate', 'dj-token');
       expect(res.status).toBe(502);
-      expect(await res.json()).toMatchObject({
-        error: 'Activation failed (backend unavailable)',
-        status: status(false),
+      expect(await res.json()).toMatchObject({ error: 'Activation failed (backend unavailable)' });
+    });
+
+    it('returns 200 on a clean activation (no failedEffect)', async () => {
+      const url = await mount({
+        activate: vi.fn(async () => ({})),
+        getStatus: vi.fn(() => status(true)),
       });
+      const res = await send(url, 'POST', '/api/auto-dj/activate', 'dj-token');
+      expect(res.status).toBe(200);
     });
   });
 

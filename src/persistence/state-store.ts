@@ -42,12 +42,20 @@ export class TransientReadError extends Error {
 }
 
 // errnos treated as retriable rather than permanent corruption. A redeploy can
-// momentarily surface these (EIO disk fault, EACCES ownership/perms change, EISDIR
-// mid-mount, EBUSY/EAGAIN/ETIMEDOUT). Deliberately conservative: an UNKNOWN errno
-// falls through to CorruptSnapshotError (probe-and-end), so a misclassified fault
-// fails safe toward ending an orphan, never toward leaving one running. Widen only
-// with evidence.
-const RETRIABLE_READ_ERRNOS = new Set(['EIO', 'EACCES', 'EAGAIN', 'EBUSY', 'EISDIR', 'ETIMEDOUT']);
+// momentarily surface these (EIO disk fault, EACCES/EPERM ownership/perms change,
+// EISDIR mid-mount, EBUSY/EAGAIN/ETIMEDOUT). Deliberately conservative: an UNKNOWN
+// errno falls through to CorruptSnapshotError (probe-and-end), so a misclassified
+// fault fails safe toward ending an orphan, never toward leaving one running. Widen
+// only with evidence.
+const RETRIABLE_READ_ERRNOS = new Set([
+  'EIO',
+  'EACCES',
+  'EPERM',
+  'EAGAIN',
+  'EBUSY',
+  'EISDIR',
+  'ETIMEDOUT',
+]);
 
 // Monotonic across every StateStore write in the process, so each write's temp file
 // is unique even across multiple StateStore instances (see tempPath()).
