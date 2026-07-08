@@ -5,7 +5,8 @@
  */
 import { Router } from 'express';
 import type { Orchestrator } from '../../core/orchestrator.js';
-import type { AuthUser, JwtVerifier } from '../jwks-verifier.js';
+import { reduceStatusBelowDj } from '../../core/selectors.js';
+import { hasRole, type AuthUser, type JwtVerifier } from '../jwks-verifier.js';
 import { requireAuth } from '../middleware/require-dj-jwt.js';
 
 export function virtualSwitchRouter(deps: {
@@ -15,9 +16,16 @@ export function virtualSwitchRouter(deps: {
   const router = Router();
   const { orchestrator, verifier } = deps;
 
-  // Read-only: any authenticated user (drives dj-site greyscale for everyone).
+  // Read-only, reachable by any authenticated user (drives dj-site greyscale for
+  // everyone), but the payload detail is role-gated per networking-spec §3.10.4:
+  // `dj` and above see the full status; below-`dj` members get the
+  // identity-reduced projection (no activating/deactivating DJ identity, no
+  // showId). Access is unchanged — a missing/invalid token is still 401, a
+  // member is never 403'd.
   router.get('/status', requireAuth(verifier, null), (_req, res) => {
-    res.status(200).json(orchestrator.getStatus());
+    const auth = res.locals.auth as AuthUser;
+    const status = orchestrator.getStatus();
+    res.status(200).json(hasRole(auth.role, 'dj') ? status : reduceStatusBelowDj(status));
   });
 
   router.post('/activate', requireAuth(verifier, 'dj'), async (_req, res) => {
