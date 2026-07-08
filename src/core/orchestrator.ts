@@ -138,11 +138,19 @@ export class Orchestrator {
    */
   reconcileTransitional(): Promise<void> {
     return this.enqueue(async () => {
-      // A boot ACTIVE-snapshot-but-off-air reconfirm (item 8) takes priority: it is
-      // armed while in-memory is INACTIVE, so it can't be found by the phase check.
+      // A boot ACTIVE-snapshot-but-off-air reconfirm (item 8) takes priority — but ONLY
+      // while the machine is still in the INACTIVE state it was armed in. If a normal
+      // activation (or any phase change) intervened during the reconfirm window, the
+      // reconfirm is STALE: re-attaching its snapshot now would clobber a freshly-live
+      // show (the on-air probe is Auto-DJ-account-scoped, so it reads true for the NEW
+      // show and would be misread as "false negative resolved"). Re-read the phase
+      // inside the enqueued unit and drop a stale reconfirm rather than acting on it.
       if (this.reconfirmOffAir) {
-        await this.reconfirmActiveLiveness();
-        return;
+        if (this.state.phase === 'INACTIVE') {
+          await this.reconfirmActiveLiveness();
+          return;
+        }
+        this.reconfirmOffAir = null; // stale — the machine moved on; fall through
       }
       const phase = this.state.phase; // re-read inside the unit, not at call time
       if (phase === 'ACTIVATING' || phase === 'DEACTIVATING') {

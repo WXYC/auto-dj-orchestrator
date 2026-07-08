@@ -708,4 +708,28 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('drops a stale reconfirm when a new activation happens before the reconcile tick', async () => {
+    // Boot with an ACTIVE snapshot whose show genuinely ended during the outage:
+    // first probe off-air arms the reconfirm (in-memory INACTIVE).
+    const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
+    const h = harness({ snapshot });
+    h.flowsheet.isOnAir.mockResolvedValue(false);
+    await h.orchestrator.recover();
+    expect(h.orchestrator.getStatus().active).toBe(false); // reconfirm armed
+
+    // A human activates during the reconfirm window (status read "off", so this is
+    // expected operator behavior). A NEW show is created and goes live.
+    h.flowsheet.isOnAir.mockResolvedValue(true);
+    await h.orchestrator.activate({ userId: 'u1' });
+    expect(h.orchestrator.getStatus().showId).toBe(701); // fresh join()
+
+    // The reconcile tick must NOT let the stale reconfirm(789) clobber the live show:
+    // the phase has moved on to ACTIVE, so the armed reconfirm is obsolete and dropped.
+    await h.orchestrator.reconcileTransitional();
+    const status = h.orchestrator.getStatus();
+    expect(status.active).toBe(true);
+    expect(status.showId).toBe(701); // still the live show, NOT rewound to 789
+    expect(status.activatedBy?.userId).toBe('u1'); // attribution intact, not "recovered"
+  });
 });

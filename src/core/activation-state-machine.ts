@@ -254,7 +254,11 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
 
     case 'RECOVERED': {
       // Re-attach to an existing show after a restart. No START_SHOW (it exists);
-      // the subscriber already runs continuously, so no SUBSCRIBE either.
+      // the subscriber already runs continuously, so no SUBSCRIBE either. Guard on
+      // INACTIVE (like SHOW_STARTED guards ACTIVATING, SHOW_ENDED guards DEACTIVATING):
+      // a RECOVERED that arrives after the machine has already activated a NEW show —
+      // e.g. a stale item-8 reconfirm — must not clobber the live show's id/watermarks.
+      if (state.phase !== 'INACTIVE') return { state, effects: [] };
       return {
         state: {
           ...state,
