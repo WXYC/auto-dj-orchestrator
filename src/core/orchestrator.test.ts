@@ -764,6 +764,32 @@ describe('Orchestrator — reconcile (periodic driver)', () => {
     expect(h.orchestrator.getStatus().showId).toBeUndefined();
   });
 
+  it('retries a boot ACTIVATING that could not converge (indeterminate probe) on the next tick', async () => {
+    const h = harness({ snapshot: { phase: 'ACTIVATING' } });
+    h.flowsheet.isOnAir.mockRejectedValueOnce(new Error('BS down')); // boot probe indeterminate
+    await h.orchestrator.recover();
+    // recover() could not converge (probe threw with no show id), so it leaves the
+    // ACTIVATING snapshot and marks recovery pending — in-memory is INACTIVE, which the
+    // tick would otherwise skip.
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    expect(h.flowsheet.end).not.toHaveBeenCalled();
+    // The next tick re-runs recovery in-process; the probe now reads off-air → settle.
+    h.flowsheet.isOnAir.mockResolvedValue(false);
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.isOnAir).toHaveBeenCalledTimes(2); // boot probe + in-process re-probe
+  });
+
+  it('retries a boot DEACTIVATING whose end() failed on the next tick', async () => {
+    const h = harness({ snapshot: { phase: 'DEACTIVATING', showId: 789 }, isOnAir: true });
+    h.flowsheet.end.mockRejectedValueOnce(new Error('BS down')); // boot end() fails
+    await h.orchestrator.recover();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // tried once at boot, failed
+    expect(h.orchestrator.getStatus().active).toBe(false);
+    // The next tick re-runs recovery; end() now succeeds → converges in-process.
+    await h.orchestrator.reconcileTransitional();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(2); // retried without a restart
+  });
+
   it('retries a transient boot-read failure on the next reconcile tick (in-process, no restart)', async () => {
     const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
     const h = harness({ snapshot, isOnAir: true });
