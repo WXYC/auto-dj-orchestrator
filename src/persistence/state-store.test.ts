@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { mkdir, mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { CorruptSnapshotError, StateStore, TransientReadError, type Snapshot } from './state-store.js';
 import type { Logger } from '../logger.js';
 
@@ -28,6 +28,9 @@ describe('StateStore', () => {
   });
 
   afterEach(async () => {
+    // A failure-injection test may leave the dir read-only; restore write so rm can
+    // unlink its contents.
+    await chmod(dir, 0o755).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -77,17 +80,34 @@ describe('StateStore', () => {
       expect(entries).toEqual(['state.json']); // temp sibling was renamed away, not left
     });
 
-    it('never truncates a previously-valid snapshot when a later save fails mid-write', async () => {
+    it('gives each write a unique temp path so concurrent writes do not collide', async () => {
       const store = new StateStore(path);
+      // Fire several writes concurrently. A shared temp path would let them race on the
+      // same file — one rename removing the file another is mid-write on (ENOENT), or a
+      // stray temp left behind. Unique per-write temp paths let them all complete and
+      // leave only the final snapshot.
+      await Promise.all(
+        Array.from({ length: 8 }, (_, i) => store.saveStrict({ ...snapshot, lastPostedShId: i })),
+      );
+      const entries = await readdir(dir);
+      expect(entries).toEqual(['state.json']); // no stray .tmp files
+      const onDisk = JSON.parse(await readFile(path, 'utf8')) as Snapshot;
+      expect(typeof onDisk.lastPostedShId).toBe('number'); // a valid, non-torn snapshot
+    });
+
+    it('never truncates a previously-valid snapshot when a later save fails mid-write', async () => {
+      const store = new StateStore(path, fakeLogger().asLogger);
       await store.save(snapshot); // a good snapshot is on disk
 
-      // Make the temp-file write genuinely fail (no module mocking): occupy the
-      // fixed temp path with a directory so writeFile(tmp) throws EISDIR.
-      const tmp = join(dirname(path), `.${basename(path)}.tmp`);
-      await mkdir(tmp);
+      // Make the temp-file write genuinely fail (no module mocking): a read-only parent
+      // directory makes writeFile(tmp) throw EACCES. (Temp paths are per-write unique
+      // now, so occupying a fixed name no longer works — and this exercises atomicity
+      // regardless of the temp name.)
+      await chmod(dir, 0o555);
       const { logger, asLogger } = fakeLogger();
       const failing = new StateStore(path, asLogger);
       await expect(failing.save({ ...snapshot, lastPostedShId: 999 })).resolves.toBeUndefined();
+      await chmod(dir, 0o755); // restore so the read below (and cleanup) can proceed
 
       // The live snapshot is intact (the old value), not a 0-byte/torn file that
       // load() would treat as "no snapshot" and orphan a running show.
@@ -121,10 +141,10 @@ describe('StateStore', () => {
     it('does not corrupt the live snapshot when a strict write fails', async () => {
       const store = new StateStore(path);
       await store.save(snapshot); // a good snapshot is on disk
-      // Occupy the fixed temp path with a directory so writeFile(tmp) throws EISDIR.
-      const tmp = join(dirname(path), `.${basename(path)}.tmp`);
-      await mkdir(tmp);
+      // A read-only parent directory makes writeFile(tmp) throw EACCES.
+      await chmod(dir, 0o555);
       await expect(store.saveStrict({ ...snapshot, lastPostedShId: 999 })).rejects.toThrow();
+      await chmod(dir, 0o755);
       const onDisk = JSON.parse(await readFile(path, 'utf8')) as Snapshot;
       expect(onDisk.lastPostedShId).toBe(555); // old value intact, not torn
     });

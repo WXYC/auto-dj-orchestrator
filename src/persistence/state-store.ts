@@ -49,6 +49,10 @@ export class TransientReadError extends Error {
 // with evidence.
 const RETRIABLE_READ_ERRNOS = new Set(['EIO', 'EACCES', 'EAGAIN', 'EBUSY', 'EISDIR', 'ETIMEDOUT']);
 
+// Monotonic across every StateStore write in the process, so each write's temp file
+// is unique even across multiple StateStore instances (see tempPath()).
+let writeSeq = 0;
+
 export class StateStore {
   constructor(
     private readonly path: string,
@@ -84,6 +88,19 @@ export class StateStore {
   }
 
   /**
+   * A unique temp path per write. Correctness must not depend on writes being
+   * serialized: recovery's settleInactive()/endPossibleOrphanAndSettle() call save()
+   * directly (off the orchestrator's enqueue chain), so a fixed temp name could be
+   * raced by two writers — one's writeFile truncating the other's, or one's rename
+   * removing the file the other is about to rename (ENOENT). A per-write name
+   * (pid + a process-monotonic counter) removes that coupling; rename(2) stays atomic.
+   */
+  private tempPath(): string {
+    writeSeq += 1;
+    return join(dirname(this.path), `.${basename(this.path)}.${process.pid}.${writeSeq}.tmp`);
+  }
+
+  /**
    * Atomically persist a snapshot, throwing on failure. Used to gate a network
    * call on a durable write (the ACTIVATING intent — see the orchestrator).
    */
@@ -91,16 +108,14 @@ export class StateStore {
     // Write to a temp file then atomically rename. rename(2) is atomic within a
     // filesystem, so a crash mid-write can never truncate the live snapshot — a
     // bare writeFile() opens with O_TRUNC and would leave a 0-byte file, which
-    // load() then treats as "no snapshot" and orphans a running show. Saves are
-    // serialized through the orchestrator's promise chain, so a fixed temp name
-    // is safe.
-    const tmp = join(dirname(this.path), `.${basename(this.path)}.tmp`);
+    // load() then treats as "no snapshot" and orphans a running show.
+    const tmp = this.tempPath();
     try {
       await writeFile(tmp, JSON.stringify(snapshot), 'utf8');
       await rename(tmp, this.path);
     } catch (err) {
-      // recursive so a stray directory at the fixed temp path can't wedge every
-      // future write (writeFile would keep throwing EISDIR otherwise).
+      // recursive so a stray directory at the temp path can't wedge the cleanup
+      // (writeFile would have thrown EISDIR; rm of a dir needs recursive).
       await rm(tmp, { force: true, recursive: true }).catch(() => {});
       throw err;
     }
