@@ -139,6 +139,37 @@ describe('Orchestrator — restart recovery', () => {
     expect(h.arduino.send).toHaveBeenCalledWith('resume'); // relay re-asserted on re-attach
   });
 
+  it('restores the persisted breakpoint hour on re-attach so the next hour still posts its breakpoint', async () => {
+    // Last breakpoint posted at hour 100; the process restarts during hour 101,
+    // before hour 101's breakpoint. Recovery must restore lastBreakpointHour from
+    // the snapshot (100), not reset it to the current hour (101) — otherwise the
+    // HOUR_TICK guard (epochHour <= lastBreakpointHour) treats hour 101 as
+    // already-posted and silently skips the hourly breakpoint.
+    const snapshot: Snapshot = {
+      phase: 'ACTIVE',
+      showId: 789,
+      activatedBy: { source: 'virtual_switch', userId: 'u1', at: '2026-03-07T22:00:00.000Z' },
+      lastBreakpointHour: 100,
+    };
+    const h = harness({ snapshot, isOnAir: true, startHourMs: 101 * HOUR });
+    await h.orchestrator.recover();
+    await h.orchestrator.hourTick(); // now = hour 101
+    expect(h.flowsheet.addBreakpoint).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends the orphan and settles inactive when an ACTIVE snapshot is malformed (no showId)', async () => {
+    // A partial/older snapshot: phase ACTIVE but showId missing, so we can't
+    // re-attach. Recovery must still probe BS and end any orphaned show rather
+    // than ignore a possibly-live Auto-DJ show it can no longer identify.
+    const snapshot = { phase: 'ACTIVE', lastBreakpointHour: 100 } as Snapshot;
+    const h = harness({ snapshot, isOnAir: true });
+    await h.orchestrator.recover();
+    expect(h.flowsheet.isOnAir).toHaveBeenCalled();
+    expect(h.flowsheet.end).toHaveBeenCalledTimes(1); // orphan torn down
+    expect(h.orchestrator.getStatus().active).toBe(false); // settled INACTIVE
+    expect(h.arduino.send).toHaveBeenCalledWith('pause');
+  });
+
   it('stays inactive when the snapshot is active but BS reports off-air', async () => {
     const snapshot: Snapshot = { phase: 'ACTIVE', showId: 789, lastBreakpointHour: 100 };
     const h = harness({ snapshot, isOnAir: false });

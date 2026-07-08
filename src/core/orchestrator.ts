@@ -205,8 +205,11 @@ export class Orchestrator {
       return;
     }
 
-    // phase ACTIVE: re-attach to the running show. Restore lastPostedShId so the
-    // subscriber's first poll doesn't re-post the still-playing track.
+    // phase ACTIVE: re-attach to the running show. Restore the persisted
+    // watermarks — lastBreakpointHour (so a restart mid-hour still posts that
+    // hour's breakpoint instead of skipping it) and lastPostedShId (so the
+    // subscriber's first poll doesn't re-post the still-playing track). Fall back
+    // to the current hour only if the snapshot predates breakpoint tracking.
     await this.enqueue(() =>
       this.applyEvent({
         kind: 'RECOVERED',
@@ -216,7 +219,7 @@ export class Orchestrator {
           detail: 'recovered',
           at: this.nowIso(),
         },
-        epochHour: epochHour(this.now()),
+        lastBreakpointHour: snap.lastBreakpointHour ?? epochHour(this.now()),
         lastPostedShId: snap.lastPostedShId,
       }),
     );
