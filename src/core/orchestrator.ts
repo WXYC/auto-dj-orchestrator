@@ -336,10 +336,13 @@ export class Orchestrator {
       case 'START_SHOW': {
         const showId = await this.deps.flowsheet.join();
         await this.applyEvent({ kind: 'SHOW_STARTED', showId, epochHour: epochHour(this.now()) });
-        // SHOW_STARTED's persist is best-effort; re-persist the ACTIVE+showId marker
-        // so a single dropped write can't leave ACTIVATING on disk, which recovery
-        // would treat as an orphan to END — tearing down this healthy live show.
-        await this.deps.stateStore.save(snapshotOf(this.state));
+        // The ONE strict write that reaches ACTIVE (item 3). SHOW_STARTED emits no
+        // PERSIST_STATE, so this is the only persist of the ACTIVATING -> ACTIVE
+        // transition: a durable ACTIVE+id means "confirmed show", ACTIVATING-on-disk
+        // always means "unconfirmed". If it throws, phase is already ACTIVE and
+        // handleEffectFailure's START_SHOW/ACTIVE branch re-enters teardown so end()
+        // reconciles BS to match — never leaving ACTIVATING-on-disk under ACTIVE.
+        await this.deps.stateStore.saveStrict(snapshotOf(this.state));
         // Post the currently-playing track as the show's opening entry (the
         // subscriber runs continuously, so no NOW_PLAYING arrives just for
         // having activated).
@@ -395,6 +398,25 @@ export class Orchestrator {
       this.deps.logger.warn('activation-intent persist failed; aborting activation');
       this.state = { ...initialState };
       this.deps.arduino.send('pause');
+      return true;
+    }
+    if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVE') {
+      // The post-join strict ACTIVE persist threw: memory is ACTIVE (SHOW_STARTED
+      // ran) but disk is still ACTIVATING — a split brain. There is no reducer event
+      // for ACTIVE -> INACTIVE, so re-enter the UNIFIED teardown path: dispatch
+      // DEACTIVATE_REQUESTED (ACTIVE -> DEACTIVATING, emits END_SHOW) and route into
+      // the same END_SHOW handler above — a good end() converges INACTIVE, a failed
+      // end() leaves DEACTIVATING for the reconciler. Do NOT hand-roll end() +
+      // settleInactive() here: a second teardown path is exactly what this redesign
+      // collapses, and any refactor that inlines it reintroduces the divergence.
+      // Dispatch inline via applyEvent, NEVER enqueue() — enqueue wraps only external
+      // entry points; a nested enqueue here would deadlock the outer runEffects chain
+      // (this is the established re-entrant pattern, cf. the END_SHOW branch below).
+      // source 'virtual_switch': the DEACTIVATE_REQUESTED event source is limited to
+      // 'virtual_switch' | 'button', and the wire AutoDJActivationSource enum has no
+      // internal member, so we reuse 'virtual_switch' rather than break the contract.
+      this.deps.logger.warn('post-join ACTIVE persist failed; rolling the show back through teardown');
+      await this.applyEvent({ kind: 'DEACTIVATE_REQUESTED', source: 'virtual_switch', at: this.nowIso() });
       return true;
     }
     if (effect.type === 'START_SHOW' && this.state.phase === 'ACTIVATING') {

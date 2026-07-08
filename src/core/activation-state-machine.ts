@@ -194,7 +194,13 @@ export function reduce(state: ActivationState, event: Event): ReduceResult {
           lastBreakpointHour: event.epochHour,
           lastPostedShId: undefined, // fresh show: let the opening entry post
         },
-        effects: [{ type: 'PERSIST_STATE' }],
+        // No PERSIST_STATE (item 3): the orchestrator owns the single post-join
+        // saveStrict(ACTIVE+id). Reaching ACTIVE through exactly one STRICT write
+        // means ACTIVATING-on-disk always signifies "no confirmed show", so the
+        // reconciler can end an on-air orphan without risk of tearing down a
+        // healthy show whose best-effort ACTIVE persist merely dropped. Emitting a
+        // best-effort PERSIST_STATE here would re-open that split brain.
+        effects: [],
       };
     }
 
