@@ -169,8 +169,16 @@ export class Orchestrator {
     this.deps.azuracast.stop();
   }
 
-  /** Boot recovery: re-attach to an in-progress show only if BS confirms it is on air. */
-  async recover(): Promise<void> {
+  /**
+   * Boot recovery: re-attach to an in-progress show only if BS confirms it is on air.
+   * Returns `{ needsResume }` — `true` when a live show was re-attached and the relay
+   * must be re-asserted. The resume is DEFERRED to the caller (item 9): index.ts sends
+   * it AFTER starting the subscriber, so a live DJ who took over during the outage can
+   * preempt via the subscriber's first is_live sample before Auto-DJ audio is routed.
+   * recover() completes all its StateStore writes before returning, so the boot-order
+   * invariant (writes before anything enqueues) holds regardless of the deferred resume.
+   */
+  async recover(): Promise<{ needsResume: boolean }> {
     let snap: Snapshot | null;
     try {
       snap = await this.deps.stateStore.load();
@@ -185,7 +193,7 @@ export class Orchestrator {
           { err },
           'recovery: snapshot read transiently failed; leaving state for a later retry',
         );
-        return;
+        return { needsResume: false };
       }
       // A corrupt (or unknown-fault) snapshot: something was persisted but is
       // permanently unreadable, so a show may be on air with an id we can't recover.
@@ -196,9 +204,9 @@ export class Orchestrator {
         'recovery: state snapshot unreadable; probing BS for an orphan',
       );
       await this.endPossibleOrphanAndSettle();
-      return;
+      return { needsResume: false };
     }
-    if (!snap) return; // first boot, or a clean shutdown left no snapshot
+    if (!snap) return { needsResume: false }; // first boot, or a clean shutdown left no snapshot
 
     // ACTIVATING: activation was interrupted before we learned the show id, so
     // flowsheet.join() may or may not have created a show in BS. Probe and tear
@@ -206,15 +214,15 @@ export class Orchestrator {
     // we never auto-resurrect; a human must re-activate.
     if (snap.phase === 'ACTIVATING') {
       await this.endPossibleOrphanAndSettle();
-      return;
+      return { needsResume: false };
     }
 
     // Only ACTIVE / DEACTIVATING carry a show to re-attach to or finish.
-    if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return;
+    if (snap.phase !== 'ACTIVE' && snap.phase !== 'DEACTIVATING') return { needsResume: false };
     if (snap.showId === undefined) {
       // Malformed (ACTIVE/DEACTIVATING with no id): treat like an unknown show.
       await this.endPossibleOrphanAndSettle();
-      return;
+      return { needsResume: false };
     }
 
     // Distinguish "definitely off-air" (probe returned false) from "couldn't
@@ -244,7 +252,7 @@ export class Orchestrator {
           { showId: snap.showId },
           'recovery: snapshot ACTIVE but first probe off-air; reconfirming before converging',
         );
-        return;
+        return { needsResume: false };
       }
       // DEACTIVATING + off-air: the operator was ending this show and it is confirmed
       // off — converge. (No false-negative reconfirm here: the intended end state is
@@ -254,7 +262,7 @@ export class Orchestrator {
         'snapshot was deactivating and BS reports off-air; settling inactive',
       );
       await this.settleInactive();
-      return;
+      return { needsResume: false };
     }
 
     if (snap.phase === 'DEACTIVATING') {
@@ -270,18 +278,21 @@ export class Orchestrator {
           { err },
           'recovery: failed to finish interrupted deactivation; leaving it for the next boot to retry',
         );
-        return;
+        return { needsResume: false };
       }
       await this.settleInactive();
       this.deps.logger.info(
         { showId: snap.showId },
         'finished an interrupted deactivation on recovery',
       );
-      return;
+      return { needsResume: false };
     }
 
     // phase ACTIVE (on-air, or an indeterminate probe): re-attach to the running show.
-    await this.attachRecoveredShow(snap);
+    // Defer the relay resume to the caller (item 9) — it fires after the subscriber
+    // starts so a live DJ can preempt.
+    await this.attachRecoveredShow(snap, { sendResume: false });
+    return { needsResume: true };
   }
 
   /**
@@ -296,8 +307,12 @@ export class Orchestrator {
    * Dispatches via applyEvent directly (NOT enqueue): recover() runs off-chain as the
    * sole writer at boot, and the reconfirm path already runs inside an enqueued unit —
    * a nested enqueue would deadlock the chain.
+   *
+   * `sendResume` gates the relay: the boot path defers it (the subscriber isn't running
+   * yet, item 9), while the on-air reconfirm path — which runs on a tick, subscriber
+   * already live — asserts it inline.
    */
-  private async attachRecoveredShow(snap: Snapshot): Promise<void> {
+  private async attachRecoveredShow(snap: Snapshot, opts: { sendResume: boolean }): Promise<void> {
     await this.applyEvent({
       kind: 'RECOVERED',
       showId: snap.showId!,
@@ -309,8 +324,18 @@ export class Orchestrator {
       lastBreakpointHour: snap.lastBreakpointHour ?? epochHour(this.now()),
       lastPostedShId: snap.lastPostedShId,
     });
-    this.deps.arduino.send('resume');
+    if (opts.sendResume) this.deps.arduino.send('resume');
     this.deps.logger.info({ showId: snap.showId }, 'recovered active auto-dj show');
+  }
+
+  /**
+   * Re-assert the relay for a show re-attached by boot recover(). index.ts calls this
+   * AFTER azuracast.start(), so the subscriber's first is_live sample can preempt a
+   * live DJ who took over during the outage before Auto-DJ audio is routed (item 9).
+   * A one-shot 'resume' a crash or relay reset may have missed.
+   */
+  resumeRecoveredShow(): void {
+    this.deps.arduino.send('resume');
   }
 
   /**
@@ -339,7 +364,7 @@ export class Orchestrator {
       return;
     }
     this.deps.logger.info({ showId: snap.showId }, 'recovery: reconfirm read on-air (false negative); re-attaching');
-    await this.attachRecoveredShow(snap);
+    await this.attachRecoveredShow(snap, { sendResume: true });
   }
 
   /**

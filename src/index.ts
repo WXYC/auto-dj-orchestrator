@@ -97,13 +97,23 @@ async function main(): Promise<void> {
   });
   wsServer.attach(server);
 
-  // Recover from a persisted snapshot first (based on Backend-Service state),
-  // THEN start the continuous subscriber. If recovery re-attached a show but a
-  // live DJ is actually on air, the subscriber's first poll emits is_live before
-  // any track (ingest order), so RELAY_STATE force-deactivates before any live
-  // track is posted — self-correcting "live DJ wins".
-  await orchestrator.recover();
+  // CRITICAL BOOT ORDER: recover() must finish all StateStore WRITES before
+  // azuracast.start()/orchestrator.start()/server.listen() arm anything that enqueues
+  // (the subscriber's onTrack/onLive, the ticker's hourTick/reconcile, HTTP
+  // activate/deactivate). recover() runs off the enqueue chain, so it is the sole
+  // writer during boot only while nothing else can enqueue — this ordering is what
+  // keeps StateStore's temp-path safe (items 4, 10). Do not move the ticker, subscriber,
+  // or listener ahead of recover().
+  //
+  // The relay 'resume' for a re-attached show is intentionally deferred to AFTER
+  // azuracast.start() (item 9): it is a hardware command, not a persist, so it is exempt
+  // from the writes-first rule, and starting the subscriber first lets its first is_live
+  // sample preempt a live DJ who took over during the outage (RELAY_STATE force-deactivates
+  // before any live track is posted — self-correcting "live DJ wins") instead of routing
+  // Auto-DJ audio over them.
+  const recovery = await orchestrator.recover();
   azuracast.start();
+  if (recovery.needsResume) orchestrator.resumeRecoveredShow();
   orchestrator.start();
 
   server.listen(config.ORCHESTRATOR_PORT, () => {
