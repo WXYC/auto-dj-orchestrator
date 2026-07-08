@@ -67,4 +67,16 @@ describe('reduceStatusBelowDj', () => {
     reduceStatusBelowDj(input);
     expect(input).toEqual(FULL_ACTIVE);
   });
+
+  it('drops an unknown/future field (allowlist — fails closed)', () => {
+    // A field added to the AutoDJStatus schema later must not leak by default.
+    // The compile-time tie in selectors.ts forces it to be classified; this
+    // asserts the runtime allowlist behavior for anything not on the keep-list.
+    const withFutureField = {
+      ...FULL_ACTIVE,
+      internalSessionId: 'leak-me',
+    } as AutoDJStatus & { internalSessionId: string };
+    const reduced = reduceStatusBelowDj(withFutureField);
+    expect(reduced).not.toHaveProperty('internalSessionId');
+  });
 });
