@@ -3,6 +3,7 @@ dist/
 *.log
 .env
 .env.local
+Dockerfile.env
 .DS_Store
 coverage/
 worklog/

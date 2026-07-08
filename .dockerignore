@@ -7,6 +7,7 @@ dist
 coverage
 .env
 .env.*
+Dockerfile.env
 .git
 .gitignore
 .dockerignore
