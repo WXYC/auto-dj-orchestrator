@@ -9,9 +9,14 @@
  * failed-downstream-effect 502 on both /activate and /deactivate.
  *
  * The /deactivate failed-teardown 502 keys off the outcome the orchestrator
- * reports (`deactivate().failedEffect === 'END_SHOW'`), NOT getStatus().active:
- * the machine converges to INACTIVE whether flowsheet.end() succeeds or fails,
- * so `active` can't reveal a failed teardown (see #15).
+ * reports (`deactivate().failedEffect === 'END_SHOW'`), NOT getStatus().active.
+ * Since the recovery redesign a failed teardown stays DEACTIVATING (the show is
+ * still live in BS until reconcile confirms off-air) — which `isActive` counts as
+ * on-air, so `active` is `true` after a failed deactivate and `false` after a
+ * clean one. The router still uses `failedEffect`, not `active`: it is the precise
+ * per-request outcome, whereas `active` describes live air state that a later
+ * reconcile can flip (it retries end() and eventually converges INACTIVE) while
+ * this request's teardown still failed. See #15, and the recovery redesign #17.
  */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
