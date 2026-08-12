@@ -24,7 +24,7 @@
     "orchestrator",
     "flowsheet"
   ],
-  "license": "ISC",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "dependencies": {
     "@wxyc/shared": "^1.17.1",
     "centrifuge": "^5.3.0",
