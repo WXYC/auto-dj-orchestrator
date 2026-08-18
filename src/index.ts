@@ -11,6 +11,7 @@ import { TokenManager } from './backend/token-manager.js';
 import { Orchestrator } from './core/orchestrator.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
+import { runPreflight } from './preflight.js';
 import { createJwtVerifier, remoteJwks } from './http/jwks-verifier.js';
 import { createApp } from './http/server.js';
 import { StateStore } from './persistence/state-store.js';
@@ -22,6 +23,8 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.LOG_LEVEL);
   logger.info({ port: config.ORCHESTRATOR_PORT }, 'auto-dj-orchestrator starting');
+
+  await runPreflight(config, logger);
 
   const tokenManager = new TokenManager({
     authUrl: config.AUTH_SERVICE_URL,

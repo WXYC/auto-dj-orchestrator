@@ -20,7 +20,10 @@ const schema = z.object({
   // AzuraCast
   AZURACAST_WS_URL: z.string().url(),
   AZURACAST_HTTP_URL: z.string().url(),
-  AZURACAST_STATION_SHORTCODE: z.string().min(1),
+  AZURACAST_STATION_SHORTCODE: z
+    .string()
+    .min(1)
+    .regex(/^[a-z0-9_-]+$/, 'must be a lowercase alphanumeric shortcode (Centrifugo channel name)'),
   AZURACAST_SAFETY_POLL_MS: z.coerce.number().int().positive().default(60_000),
   AZURACAST_FALLBACK_POLL_MS: z.coerce.number().int().positive().default(20_000),
 
@@ -28,8 +31,8 @@ const schema = z.object({
   BACKEND_SERVICE_URL: z.string().url(),
   AUTH_SERVICE_URL: z.string().url(),
   AUTH_TRUSTED_ORIGIN: z.string().url(),
-  AUTO_DJ_EMAIL: z.string().min(1),
-  AUTO_DJ_PASSWORD: z.string().min(1),
+  AUTO_DJ_EMAIL: z.string().email('must be a valid email for the Auto-DJ service account'),
+  AUTO_DJ_PASSWORD: z.string().min(8, 'AUTO_DJ_PASSWORD must be at least 8 characters'),
   AUTO_DJ_SHOW_NAME: z.string().default('Auto DJ'),
   TOKEN_REFRESH_SKEW_MS: z.coerce.number().int().nonnegative().default(60_000),
 
