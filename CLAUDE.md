@@ -34,11 +34,13 @@ Entry posting is deliberately **at-least-once, never at-most-once**: `ENTRY_POST
 | `src/backend/`     | token manager (service-account sign-in + refresh), flowsheet client, pure `map-track.ts` |
 | `src/http/`        | Express app, JWKS verifier (`jose`), virtual-switch routes                               |
 | `src/persistence/` | restart-recovery snapshot                                                                |
-| `src/ports.ts`     | `ArduinoCommandSink` / `DeviceStatusProvider` interfaces (PR B supplies the real ones)   |
+| `src/ports.ts`     | `ArduinoCommandSink` / `DeviceStatusProvider` interfaces                                 |
 
 ## Auth (service account)
 
 `TokenManager` replicates wxyc-canary's `signInDj`: `POST {AUTH_URL}/sign-in/email` (with `Origin: AUTH_TRUSTED_ORIGIN`, which must be in the auth service's `BETTER_AUTH_TRUSTED_ORIGINS`) -> session + `user.id`; then `GET {AUTH_URL}/token` -> JWT. The `dj_id` is the account's **string** `user.id`. Tokens are short-lived; the manager refreshes proactively before `exp` and reactively on a 401, coalescing concurrent refreshes into one round-trip.
+
+**Provisioning:** The `auto-dj@wxyc.org` account is a `dj`-role org member (NOT admin/stationManager/owner) self-provisioned by Backend-Service's `createAutoDjUser()` bootstrap, gated by `CREATE_AUTO_DJ_USER=TRUE` and `DEFAULT_ORG_SLUG` on the BS side (both must be set or the bootstrap silently no-ops). `AUTO_DJ_PASSWORD` is a per-environment deploy secret (distinct staging/prod). `AUTH_TRUSTED_ORIGIN` must appear in BS's `BETTER_AUTH_TRUSTED_ORIGINS`. See README.md § "Provisioning prerequisites" for the full checklist.
 
 ## Commands
 
@@ -67,8 +69,7 @@ The Arduino-facing channel. `ws-server.ts` hosts a WebSocket at `/api/auto-dj/ws
 
 ## Status
 
-- **PR A:** core service — config, AzuraCast subscriber, BS client + token manager, activation reducer + conflict/breakpoint, virtual-switch API, healthcheck.
-- **PR B:** management channel (WS server + HTTP fallback), device status, command queue, codec, Dockerfile, drivable AzuraCast mock, end-to-end integration.
+Core service is implemented: config, AzuraCast subscriber (Centrifugo + HTTP poll), BS client + token manager, activation reducer + conflict/breakpoint, virtual-switch API, management channel (WS + HTTP fallback), device status, command queue, codec, Dockerfile, drivable AzuraCast mock, restart recovery, end-to-end integration tests. Deploy pipeline (#29), real-stack integration tests (#28), and canary probe (wxyc-canary#81) are the remaining milestones.
 
 ## Shared types
 
