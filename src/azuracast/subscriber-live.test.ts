@@ -75,7 +75,7 @@ describe('AzuraCastSubscriber live poll (drivable mock)', () => {
       {
         wsUrl: 'ws://127.0.0.1:1', // refused -> degrade to polling
         httpUrl: np.url,
-        stationShortcode: 'wxyc',
+        stationShortcode: 'main',
         safetyPollMs: 40,
         fallbackPollMs: 40,
       },
