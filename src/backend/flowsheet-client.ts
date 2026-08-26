@@ -26,18 +26,44 @@ export class FlowsheetClient {
     this.fetchFn = opts.fetchFn ?? fetch;
   }
 
-  /** Start a show as the Auto-DJ account; returns the new show id. */
+  /**
+   * Start a show as the Auto-DJ account; returns the show id.
+   *
+   * BS answers at 200 with one of two shapes. A `Show` (`id`) means a new show
+   * was started. A `ShowDJ` (`show_id`, and no `id` — `show_djs` has no such
+   * column) means the most recent show was still open, so this account was
+   * added to it, or was already on it, as a co-host.
+   *
+   * The second shape is not an error and must not crash the `START_SHOW`
+   * effect: `joinShow` routes on `getLatestShow()`, the newest show regardless
+   * of `end_time`, so Auto-DJ meets it whenever a DJ left without signing off —
+   * which is exactly when Auto-DJ is most needed. Logged at warn rather than
+   * info because co-hosting somebody else's open show is a materially different
+   * outcome from owning a fresh one, and the operator should see it.
+   *
+   * Converting that case into a real takeover is the rest of #32, and is gated
+   * on the `intent` / `expected_show_id` contract (WXYC/wxyc-shared#386) and
+   * its server side (WXYC/Backend-Service#2233).
+   */
   async join(): Promise<number> {
     const djId = await this.opts.tokenManager.getUserId();
     const data = (await this.request('POST', '/flowsheet/join', {
       dj_id: djId,
       show_name: this.opts.showName,
-    })) as { id?: number };
-    if (typeof data.id !== 'number') {
-      throw new Error('BS /flowsheet/join returned no show id');
+    })) as { id?: number; show_id?: number };
+
+    if (typeof data.id === 'number') {
+      this.opts.logger?.info({ showId: data.id }, 'auto-dj show started');
+      return data.id;
     }
-    this.opts.logger?.info({ showId: data.id }, 'auto-dj show started');
-    return data.id;
+    if (typeof data.show_id === 'number') {
+      this.opts.logger?.warn(
+        { showId: data.show_id },
+        'auto-dj joined an already-open show as co-host; no new show started',
+      );
+      return data.show_id;
+    }
+    throw new Error('BS /flowsheet/join returned no show id');
   }
 
   async addEntry(track: NowPlaying): Promise<void> {
