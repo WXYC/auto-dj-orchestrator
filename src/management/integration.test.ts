@@ -205,7 +205,14 @@ describe('management channel integration', () => {
       }),
     );
     await waitFor(() => bs.calls.end.length === 1);
-    expect(orchestrator.getStatus().active).toBe(false);
+    // `end` being recorded does NOT yet mean the machine is idle. applyEvent
+    // commits the new state *before* running effects, so the relay event lands
+    // phase DEACTIVATING and only then dispatches END_SHOW; INACTIVE arrives
+    // later, when the post-effect SHOW_ENDED is applied. isActive() counts
+    // DEACTIVATING as on-air (see the getStatus comment in orchestrator.ts), so
+    // asserting immediately after the BS call samples a window where `active`
+    // is legitimately still true. Wait for the settled state instead.
+    await waitFor(() => orchestrator.getStatus().active === false);
     ws.close();
   });
 });
