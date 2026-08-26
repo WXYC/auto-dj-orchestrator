@@ -9,7 +9,7 @@ function makeSubscriber() {
     {
       wsUrl: 'wss://example/ws',
       httpUrl: 'https://example/np.json',
-      stationShortcode: 'wxyc',
+      stationShortcode: 'main',
       safetyPollMs: 60_000,
       fallbackPollMs: 20_000,
       // never actually connect during unit tests
@@ -68,7 +68,7 @@ describe('AzuraCastSubscriber.ingest', () => {
       {
         wsUrl: 'wss://example/ws',
         httpUrl: 'https://example/np.json',
-        stationShortcode: 'wxyc',
+        stationShortcode: 'main',
         safetyPollMs: 60_000,
         fallbackPollMs: 20_000,
         fetchFn: vi.fn() as unknown as typeof fetch,
@@ -94,7 +94,7 @@ describe('AzuraCastSubscriber stop() during an in-flight poll', () => {
       {
         wsUrl: 'ws://127.0.0.1:1', // refused -> polling only
         httpUrl: 'https://example/np.json',
-        stationShortcode: 'wxyc',
+        stationShortcode: 'main',
         safetyPollMs: 1000,
         fallbackPollMs: 1000,
         fetchFn,
