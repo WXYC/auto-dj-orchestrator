@@ -61,8 +61,8 @@ A Better-Auth user (`auto-dj@wxyc.org` by default) with the `dj` **org-member ro
 
 - **Role:** `dj` (org member). Deliberately NOT `stationManager`, `admin`, or `owner`. The global `user.role` stays `null` — the account cannot act as a Better-Auth admin.
 - **Handle:** `djName: "Auto DJ"` (the on-air name shown on the flowsheet). PII fields are empty — there is no person behind this account.
-- **Provisioning:** Backend-Service self-provisions the account via an idempotent startup bootstrap (`createAutoDjUser()`), gated by **two env flags on the BS side**: `CREATE_AUTO_DJ_USER=TRUE` (opt-in gate) and `DEFAULT_ORG_SLUG` (the org must already exist). If either is unset, the bootstrap silently no-ops. Self-signup is disabled (`disableSignUp: true`) and the `/auth/admin/provision-user` endpoint rejects caller-supplied passwords, so the bootstrap is the only viable path.
-- **Password:** `AUTO_DJ_PASSWORD`, stored as a per-environment deploy secret. **Must be distinct between staging and prod.** Never committed to source.
+- **Provisioning:** Backend-Service self-provisions the account via an idempotent startup bootstrap (`createAutoDjUser()`), gated by **two env vars on the BS side** that both silently no-op when missing or wrong: `CREATE_AUTO_DJ_USER=TRUE` (exact uppercase — `true` or `True` silently skip) and `DEFAULT_ORG_SLUG` (the org must already exist; if missing, the bootstrap warns and returns). Self-signup is disabled (`disableSignUp: true`) and the `/auth/admin/provision-user` endpoint rejects caller-supplied passwords, so the bootstrap is the only viable path.
+- **Password:** `AUTO_DJ_PASSWORD`, stored as a per-environment deploy secret. **Must be distinct between staging and prod.** Never committed to source. **Create-only:** the BS bootstrap is skip-if-exists and does not handle rotation — changing `AUTO_DJ_PASSWORD` on an already-provisioned environment has no effect on the BS side. To rotate, manually reset the password in Backend-Service first.
 
 ### 2. Trusted origin
 

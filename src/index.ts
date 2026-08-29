@@ -24,8 +24,6 @@ async function main(): Promise<void> {
   const logger = createLogger(config.LOG_LEVEL);
   logger.info({ port: config.ORCHESTRATOR_PORT }, 'auto-dj-orchestrator starting');
 
-  await runPreflight(config, logger);
-
   const tokenManager = new TokenManager({
     authUrl: config.AUTH_SERVICE_URL,
     email: config.AUTO_DJ_EMAIL,
@@ -122,6 +120,12 @@ async function main(): Promise<void> {
   server.listen(config.ORCHESTRATOR_PORT, () => {
     logger.info({ port: config.ORCHESTRATOR_PORT }, 'auto-dj-orchestrator listening');
   });
+
+  // Fire-and-forget: preflight diagnostics run after the server is listening so
+  // they don't block recovery, the Arduino WS endpoint, or the Docker HEALTHCHECK.
+  void runPreflight(config, logger).catch((err) =>
+    logger.warn({ err }, 'preflight failed unexpectedly'),
+  );
 
   let shuttingDown = false;
   const shutdown = (signal: string) => {
