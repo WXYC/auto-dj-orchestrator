@@ -16,7 +16,8 @@
  * discovery signal, not a hand-picked default. See #32.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { FlowsheetClient, type FlowsheetClientOptions } from './flowsheet-client.js';
+import { FlowsheetClient } from './flowsheet-client.js';
+import type { Logger } from '../logger.js';
 import type { TokenManager } from './token-manager.js';
 
 const tokenManager = {
@@ -42,9 +43,9 @@ function fetchReturning(...responses: MockResponse[]) {
   return fetchFn as unknown as typeof fetch;
 }
 
-function loggerSpy() {
-  return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
-}
+// Mirrors `fakeLogger()` in state-store.test.ts; the client only ever reaches
+// for `info` and `warn`.
+const loggerSpy = () => ({ info: vi.fn(), warn: vi.fn() });
 
 function clientWith(fetchFn: typeof fetch, logger?: ReturnType<typeof loggerSpy>) {
   return new FlowsheetClient({
@@ -52,7 +53,7 @@ function clientWith(fetchFn: typeof fetch, logger?: ReturnType<typeof loggerSpy>
     showName: 'Auto DJ',
     tokenManager,
     fetchFn,
-    logger: logger as unknown as FlowsheetClientOptions['logger'],
+    logger: logger as unknown as Logger,
   });
 }
 
@@ -104,9 +105,7 @@ describe('FlowsheetClient.join()', () => {
 
   it('takes over an abandoned show after a 409, echoing details.show.id as expected_show_id', async () => {
     const fetchFn = fetchReturning(showAlreadyOpen(555), { status: 200, body: { id: 999 } });
-    const client = clientWith(fetchFn);
-
-    await expect(client.join()).resolves.toBe(999);
+    await expect(clientWith(fetchFn).join()).resolves.toBe(999);
 
     expect(fetchFn).toHaveBeenCalledTimes(2);
     const retryBody = requestBody(fetchFn, 1);
@@ -116,11 +115,9 @@ describe('FlowsheetClient.join()', () => {
 
   it('aborts rather than retrying a second time when the takeover is refused, naming both show ids', async () => {
     const fetchFn = fetchReturning(showAlreadyOpen(555), showAlreadyOpen(777));
-    const client = clientWith(fetchFn);
-
     // Both ids, and no claim about which case it is — BS may reuse
     // `show_already_open` to refuse the very show we named.
-    await expect(client.join()).rejects.toThrow(/555[\s\S]*777/);
+    await expect(clientWith(fetchFn).join()).rejects.toThrow(/555[\s\S]*777/);
     // Bounded retry: exactly one takeover attempt, never a third call.
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
@@ -159,9 +156,7 @@ describe('FlowsheetClient.join()', () => {
       status: 400,
       body: { message: 'Bad Request: intent "takeover" requires expected_show_id' },
     });
-    const client = clientWith(fetchFn);
-
-    await expect(client.join()).rejects.toThrow(/400/);
+    await expect(clientWith(fetchFn).join()).rejects.toThrow(/400/);
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 

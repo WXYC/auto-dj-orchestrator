@@ -4,6 +4,7 @@
  * tubafrenzy path here. Authenticates as the Auto-DJ service account via the
  * TokenManager and creates the show AS that account (`dj_id === user.id`).
  */
+import type { Show, ShowDJ } from '@wxyc/shared/dtos';
 import type { NowPlaying } from '../core/state.js';
 import type { Logger } from '../logger.js';
 import { breakpointBody, mapTrackToEntry } from './map-track.js';
@@ -36,7 +37,7 @@ interface JoinRequestBody {
  * retry must echo back as `expected_show_id`.
  */
 interface ShowAlreadyOpenBody {
-  code?: string;
+  code?: 'show_already_open';
   details?: { show?: { id?: number } };
 }
 
@@ -46,16 +47,22 @@ const isShowAlreadyOpenBody = (data: unknown): data is ShowAlreadyOpenBody =>
   (data as { code?: unknown }).code === 'show_already_open';
 
 /**
- * The two 200 shapes `POST /flowsheet/join` answers with, as one value.
+ * The 200 body of `POST /flowsheet/join`, which api.yaml declares as
+ * `oneOf: [Show, ShowDJ]`, resolved to one value.
  *
  * `startedNew` is the discriminator: a `Show` (`id`) means this account now
  * owns a fresh show, a `ShowDJ` (`show_id`, and no `id` — `show_djs` has no
  * such column) means it was added to an already-open one as a co-host. Both
  * attempts in `join()` have to tell those apart, so the distinction is a field
  * rather than a re-cast at each call site.
+ *
+ * Typed against the published `Show`/`ShowDJ` rather than an ad-hoc structural
+ * cast, so a rename of either field upstream fails the build here instead of
+ * falling through to `undefined` — which would only surface at runtime, inside
+ * the `START_SHOW` effect, on the path that runs when a DJ has walked out.
  */
 const showFrom = (data: unknown): { showId: number; startedNew: boolean } | undefined => {
-  const rec = data as { id?: unknown; show_id?: unknown } | null;
+  const rec = data as (Show & ShowDJ) | null;
   if (typeof rec?.id === 'number') return { showId: rec.id, startedNew: true };
   if (typeof rec?.show_id === 'number') return { showId: rec.show_id, startedNew: false };
   return undefined;
@@ -89,32 +96,8 @@ export class FlowsheetClient {
    *    show regardless of `end_time`, so Auto-DJ meets this whenever a DJ
    *    left without signing off — which is exactly when Auto-DJ is most
    *    needed. Rather than silently co-hosting it (today's byte-identical
-   *    fallback above), take it over: re-POST with `intent: 'takeover'` and
-   *    `expected_show_id` set to the 409's `details.show.id`. That retry
-   *    either succeeds (closes that show, starts a fresh one owned by this
-   *    account) or 409s again, and the retry is bounded to one attempt —
-   *    re-driving the loop would close a show BS never named to us.
-   *
-   * WHAT THE TAKEOVER IS AND IS NOT GUARANTEED BY. The reducer only dispatches
-   * the effect that calls this method after `activate()` sees `state.liveDj`
-   * false (`activation-state-machine.ts`), and external triggers are
-   * serialized through the same promise chain, so no relay signal interleaves
-   * between that check and this call. But `liveDj` is set solely from
-   * `RELAY_STATE` — the mixing-board AUX relay the Arduino reports — which is
-   * an orchestrator-local reading of the hardware and says nothing about what
-   * BS thinks. Two gaps follow, and both end a show a human owns where the
-   * pre-takeover code merely co-hosted it:
-   *  - a stuck or mis-wired relay, or a DJ who opened their show in dj-site
-   *    before flipping the board, reads not-live while a human genuinely has
-   *    an open show;
-   *  - `expected_show_id` is a compare-and-set on the show's IDENTITY, not on
-   *    its abandonment. A human joining that same show between the 409 and the
-   *    retry leaves `details.show.id` unchanged, so BS still accepts.
-   * Narrowing this needs an abandonment signal in the decision — the 409
-   * carries `details.show.start_time` — but whether Auto-DJ takes over
-   * unconditionally or only past an idle threshold is a product question the
-   * epic deliberately left open (WXYC/auto-dj-orchestrator#36), so this
-   * deliberately does not invent a threshold.
+   *    fallback above), hand off to {@link takeOver} — which is where the
+   *    safety argument for closing somebody else's show is written down.
    *
    * This is the rest of #32 (WXYC/auto-dj-orchestrator#36); the contract is
    * WXYC/wxyc-shared#415 and its server side WXYC/Backend-Service#2233.
@@ -149,7 +132,36 @@ export class FlowsheetClient {
     if (typeof openShowId !== 'number') {
       throw new Error('BS /flowsheet/join 409 carried no details.show.id to take over');
     }
+    return this.takeOver(body, openShowId);
+  }
 
+  /**
+   * Close the show BS named in its 409 and start a fresh one owned by Auto-DJ.
+   * ONE attempt, never a loop: re-driving it would close a show BS never named
+   * to us.
+   *
+   * WHAT THIS IS AND IS NOT GUARANTEED BY — read before widening it. The
+   * reducer only dispatches the effect that reaches here after `activate()`
+   * sees `state.liveDj` false (`activation-state-machine.ts`), and external
+   * triggers are serialized through the same promise chain, so no relay signal
+   * interleaves between that check and this call. But `liveDj` is set solely
+   * from `RELAY_STATE` — the mixing-board AUX relay the Arduino reports — which
+   * is an orchestrator-local reading of the hardware and says nothing about
+   * what BS thinks. Two gaps follow, and both end a show a human owns where the
+   * pre-takeover code merely co-hosted it:
+   *  - a stuck or mis-wired relay, or a DJ who opened their show in dj-site
+   *    before flipping the board, reads not-live while a human genuinely has
+   *    an open show;
+   *  - `expected_show_id` is a compare-and-set on the show's IDENTITY, not on
+   *    its abandonment. A human joining that same show between the 409 and the
+   *    retry leaves `details.show.id` unchanged, so BS still accepts.
+   * Narrowing this needs an abandonment signal in the decision — the 409
+   * carries `details.show.start_time` — but whether Auto-DJ takes over
+   * unconditionally or only past an idle threshold is a product question the
+   * epic deliberately left open (WXYC/auto-dj-orchestrator#36), so this
+   * deliberately does not invent a threshold.
+   */
+  private async takeOver(body: JoinRequestBody, openShowId: number): Promise<number> {
     this.opts.logger?.warn(
       { showId: openShowId },
       'auto-dj found an open show with no live DJ; taking it over',
@@ -180,10 +192,9 @@ export class FlowsheetClient {
     }
 
     if (retry.status === 409) {
-      // Bounded to one attempt: re-driving the loop would close a show BS
-      // never named to us. Report both ids rather than asserting which case
-      // this is — BS may reuse `show_already_open` to reject the takeover of
-      // the very show we named, not only to report a different one.
+      // Report both ids rather than asserting which case this is — BS may
+      // reuse `show_already_open` to reject the takeover of the very show we
+      // named, not only to report a different one.
       const collidedShowId = isShowAlreadyOpenBody(retry.data)
         ? retry.data.details?.show?.id
         : undefined;
@@ -234,7 +245,7 @@ export class FlowsheetClient {
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
-    opts?: { allowStatuses?: readonly number[] },
+    options?: { allowStatuses?: readonly number[] },
   ): Promise<{ status: number; data: unknown; text: string }> {
     const token = await this.opts.tokenManager.getToken();
     let resp = await this.send(method, path, body, token);
@@ -243,14 +254,15 @@ export class FlowsheetClient {
       resp = await this.send(method, path, body, fresh);
     }
     const text = await resp.text().catch(() => '');
-    if (!resp.ok && !opts?.allowStatuses?.includes(resp.status)) {
+    if (!resp.ok && !options?.allowStatuses?.includes(resp.status)) {
       throw new Error(`BS ${method} ${path} -> ${resp.status} ${text.slice(0, 200)}`);
     }
     let data: unknown = {};
     try {
       if (text) data = JSON.parse(text);
     } catch {
-      data = {};
+      // Non-JSON body (a proxy's error page, say): leave `data` as {}. The
+      // raw body is still reachable through `text`.
     }
     return { status: resp.status, data, text };
   }
