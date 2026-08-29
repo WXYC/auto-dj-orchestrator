@@ -45,10 +45,19 @@ const isShowAlreadyOpenBody = (data: unknown): data is ShowAlreadyOpenBody =>
   data !== null &&
   (data as { code?: unknown }).code === 'show_already_open';
 
-const showIdFrom = (data: unknown): number | undefined => {
+/**
+ * The two 200 shapes `POST /flowsheet/join` answers with, as one value.
+ *
+ * `startedNew` is the discriminator: a `Show` (`id`) means this account now
+ * owns a fresh show, a `ShowDJ` (`show_id`, and no `id` — `show_djs` has no
+ * such column) means it was added to an already-open one as a co-host. Both
+ * attempts in `join()` have to tell those apart, so the distinction is a field
+ * rather than a re-cast at each call site.
+ */
+const showFrom = (data: unknown): { showId: number; startedNew: boolean } | undefined => {
   const rec = data as { id?: unknown; show_id?: unknown } | null;
-  if (typeof rec?.id === 'number') return rec.id;
-  if (typeof rec?.show_id === 'number') return rec.show_id;
+  if (typeof rec?.id === 'number') return { showId: rec.id, startedNew: true };
+  if (typeof rec?.show_id === 'number') return { showId: rec.show_id, startedNew: false };
   return undefined;
 };
 
@@ -79,19 +88,33 @@ export class FlowsheetClient {
    *    on is still open. `joinShow` routes on `getLatestShow()`, the newest
    *    show regardless of `end_time`, so Auto-DJ meets this whenever a DJ
    *    left without signing off — which is exactly when Auto-DJ is most
-   *    needed. The reducer only dispatches the effect that calls this method
-   *    after confirming `state.liveDj` is false (`activation-state-machine.ts`
-   *    `activate()`), and external triggers are serialized through the same
-   *    promise chain running this effect, so no live-DJ signal can interleave
-   *    between that check and this call: the collision can only be an
-   *    abandoned show, never a DJ genuinely on air right now. So rather than
-   *    silently co-hosting it (today's byte-identical fallback above), take
-   *    it over: re-POST with `intent: 'takeover'` and `expected_show_id` set
-   *    to the 409's `details.show.id`. That retry either succeeds (closes the
-   *    abandoned show, starts a fresh one owned by this account) or 409s
-   *    again, meaning a DIFFERENT show opened in between — never shown to
-   *    anyone, so the retry is bounded to one attempt rather than re-driving
-   *    the loop against a show nobody chose.
+   *    needed. Rather than silently co-hosting it (today's byte-identical
+   *    fallback above), take it over: re-POST with `intent: 'takeover'` and
+   *    `expected_show_id` set to the 409's `details.show.id`. That retry
+   *    either succeeds (closes that show, starts a fresh one owned by this
+   *    account) or 409s again, and the retry is bounded to one attempt —
+   *    re-driving the loop would close a show BS never named to us.
+   *
+   * WHAT THE TAKEOVER IS AND IS NOT GUARANTEED BY. The reducer only dispatches
+   * the effect that calls this method after `activate()` sees `state.liveDj`
+   * false (`activation-state-machine.ts`), and external triggers are
+   * serialized through the same promise chain, so no relay signal interleaves
+   * between that check and this call. But `liveDj` is set solely from
+   * `RELAY_STATE` — the mixing-board AUX relay the Arduino reports — which is
+   * an orchestrator-local reading of the hardware and says nothing about what
+   * BS thinks. Two gaps follow, and both end a show a human owns where the
+   * pre-takeover code merely co-hosted it:
+   *  - a stuck or mis-wired relay, or a DJ who opened their show in dj-site
+   *    before flipping the board, reads not-live while a human genuinely has
+   *    an open show;
+   *  - `expected_show_id` is a compare-and-set on the show's IDENTITY, not on
+   *    its abandonment. A human joining that same show between the 409 and the
+   *    retry leaves `details.show.id` unchanged, so BS still accepts.
+   * Narrowing this needs an abandonment signal in the decision — the 409
+   * carries `details.show.start_time` — but whether Auto-DJ takes over
+   * unconditionally or only past an idle threshold is a product question the
+   * epic deliberately left open (WXYC/auto-dj-orchestrator#36), so this
+   * deliberately does not invent a threshold.
    *
    * This is the rest of #32 (WXYC/auto-dj-orchestrator#36); the contract is
    * WXYC/wxyc-shared#415 and its server side WXYC/Backend-Service#2233.
@@ -101,21 +124,26 @@ export class FlowsheetClient {
     const body: JoinRequestBody = { dj_id: djId, show_name: this.opts.showName };
     const first = await this.request('POST', '/flowsheet/join', body, { allowStatuses: [409] });
 
-    const startedId = showIdFrom(first.data);
-    if (startedId !== undefined) {
-      if (typeof (first.data as { id?: unknown }).id === 'number') {
-        this.opts.logger?.info({ showId: startedId }, 'auto-dj show started');
+    const started = showFrom(first.data);
+    if (started) {
+      if (started.startedNew) {
+        this.opts.logger?.info({ showId: started.showId }, 'auto-dj show started');
       } else {
         this.opts.logger?.warn(
-          { showId: startedId },
+          { showId: started.showId },
           'auto-dj joined an already-open show as co-host; no new show started',
         );
       }
-      return startedId;
+      return started.showId;
     }
 
     if (first.status !== 409 || !isShowAlreadyOpenBody(first.data)) {
-      throw new Error('BS /flowsheet/join returned no show id');
+      // Carry the status and body through: `allowStatuses` suppressed
+      // `request()`'s own error, so this is the only place an unrecognized 409
+      // (a future `code`, or a proxy's non-JSON error page) gets described.
+      throw new Error(
+        `BS POST /flowsheet/join -> ${first.status} returned no show id ${first.text.slice(0, 200)}`,
+      );
     }
     const openShowId = first.data.details?.show?.id;
     if (typeof openShowId !== 'number') {
@@ -132,21 +160,35 @@ export class FlowsheetClient {
       { ...body, intent: 'takeover', expected_show_id: openShowId } satisfies JoinRequestBody,
       { allowStatuses: [409] },
     );
-    const takenOverId = showIdFrom(retry.data);
-    if (takenOverId !== undefined) {
-      this.opts.logger?.info(
-        { showId: takenOverId, closedShowId: openShowId },
-        'auto-dj took over an abandoned show',
-      );
-      return takenOverId;
+    const takenOver = showFrom(retry.data);
+    if (takenOver) {
+      if (takenOver.startedNew) {
+        this.opts.logger?.info(
+          { showId: takenOver.showId, closedShowId: openShowId },
+          'auto-dj took over an abandoned show',
+        );
+      } else {
+        // ShowDJ-shaped: BS added this account to the open show rather than
+        // closing it — the very outcome the takeover was meant to replace. Do
+        // not report a close that did not happen.
+        this.opts.logger?.warn(
+          { showId: takenOver.showId, expectedShowId: openShowId },
+          'auto-dj takeover returned a co-host membership; the open show was not closed',
+        );
+      }
+      return takenOver.showId;
     }
 
     if (retry.status === 409) {
-      // Bounded: a second 409 means a different show is open now than the one
-      // BS just told us about. Re-driving the loop would close a show nobody
-      // was ever shown.
+      // Bounded to one attempt: re-driving the loop would close a show BS
+      // never named to us. Report both ids rather than asserting which case
+      // this is — BS may reuse `show_already_open` to reject the takeover of
+      // the very show we named, not only to report a different one.
+      const collidedShowId = isShowAlreadyOpenBody(retry.data)
+        ? retry.data.details?.show?.id
+        : undefined;
       throw new Error(
-        `BS /flowsheet/join takeover collided again; a different show is open (was expecting ${openShowId})`,
+        `BS /flowsheet/join takeover of show ${openShowId} was refused with show_already_open; BS now reports show ${collidedShowId ?? 'unknown'} open`,
       );
     }
     throw new Error('BS /flowsheet/join takeover returned no show id');
@@ -181,33 +223,36 @@ export class FlowsheetClient {
    * One request with a single reactive-refresh retry on 401. Throws on any
    * other non-2xx status, unless `allowStatuses` names it — `join()` passes
    * `[409]` so a `show_already_open` collision reaches the caller as data
-   * (status + parsed body) instead of a thrown Error.
+   * instead of a thrown Error. Callers that allow a status take on describing
+   * it, so the raw `text` comes back alongside the parsed `data`.
+   *
+   * `data` tolerates an empty or non-JSON body by falling back to `{}`:
+   * addEntry/addBreakpoint/end ignore the response, so a body-less 200/204
+   * must not throw a spurious failure.
    */
   private async request(
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
     opts?: { allowStatuses?: readonly number[] },
-  ): Promise<{ status: number; data: unknown }> {
+  ): Promise<{ status: number; data: unknown; text: string }> {
     const token = await this.opts.tokenManager.getToken();
     let resp = await this.send(method, path, body, token);
     if (resp.status === 401) {
       const fresh = await this.opts.tokenManager.refresh();
       resp = await this.send(method, path, body, fresh);
     }
+    const text = await resp.text().catch(() => '');
     if (!resp.ok && !opts?.allowStatuses?.includes(resp.status)) {
-      const text = await resp.text().catch(() => '');
       throw new Error(`BS ${method} ${path} -> ${resp.status} ${text.slice(0, 200)}`);
     }
-    // Tolerate an empty / non-JSON body — addEntry/addBreakpoint/end ignore
-    // the response, so a body-less 200/204 must not throw a spurious failure.
-    const text = await resp.text();
-    if (!text) return { status: resp.status, data: {} };
+    let data: unknown = {};
     try {
-      return { status: resp.status, data: JSON.parse(text) };
+      if (text) data = JSON.parse(text);
     } catch {
-      return { status: resp.status, data: {} };
+      data = {};
     }
+    return { status: resp.status, data, text };
   }
 
   private async send(
