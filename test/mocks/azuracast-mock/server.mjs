@@ -60,6 +60,10 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && url === '/healthcheck') {
     return json(res, 200, { status: 'ok' });
   }
+  if (req.method === 'GET' && url.startsWith('/api/nowplaying/')) {
+    const shortcode = url.slice('/api/nowplaying/'.length);
+    return json(res, 200, { ...payload(), station: { shortcode } });
+  }
   if (req.method === 'POST' && url === '/__control/track') {
     const body = await readBody(req);
     state = {
