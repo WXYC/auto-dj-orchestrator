@@ -12,6 +12,14 @@
  *   2. Button ≡ virtual switch, last action wins.
  *   3. No auto-reactivation — when the live DJ clears, auto-DJ stays off until a
  *      human re-activates via the button or the virtual switch.
+ *
+ * One further conflict rule is NOT decided here, and this list is incomplete
+ * without it: when BS answers `START_SHOW` with a 409 because somebody else's
+ * show is still open, `FlowsheetClient.takeOver()` closes it. That decision
+ * lives in the backend client because only it speaks the wire, but it is a
+ * conflict rule, and its limits (`liveDj` is the AUX relay, not BS's view) are
+ * documented there. Moving it into this reducer is WXYC/auto-dj-orchestrator#36
+ * follow-up work.
  */
 import type { Activation, ActivationState, NowPlaying } from './state.js';
 
