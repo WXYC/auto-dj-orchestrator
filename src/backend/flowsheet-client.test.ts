@@ -16,7 +16,7 @@
  * discovery signal, not a hand-picked default. See #32.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { FlowsheetClient } from './flowsheet-client.js';
+import { FlowsheetClient, type FlowsheetClientOptions } from './flowsheet-client.js';
 import type { TokenManager } from './token-manager.js';
 
 const tokenManager = {
@@ -42,12 +42,17 @@ function fetchReturning(...responses: MockResponse[]) {
   return fetchFn as unknown as typeof fetch;
 }
 
-function clientWith(fetchFn: typeof fetch) {
+function loggerSpy() {
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+}
+
+function clientWith(fetchFn: typeof fetch, logger?: ReturnType<typeof loggerSpy>) {
   return new FlowsheetClient({
     backendUrl: 'http://backend:8080',
     showName: 'Auto DJ',
     tokenManager,
     fetchFn,
+    logger: logger as unknown as FlowsheetClientOptions['logger'],
   });
 }
 
@@ -109,13 +114,44 @@ describe('FlowsheetClient.join()', () => {
     expect(retryBody.expected_show_id).toBe(555);
   });
 
-  it('aborts rather than retrying a second time when the takeover collides again (a different show opened)', async () => {
+  it('aborts rather than retrying a second time when the takeover is refused, naming both show ids', async () => {
     const fetchFn = fetchReturning(showAlreadyOpen(555), showAlreadyOpen(777));
     const client = clientWith(fetchFn);
 
-    await expect(client.join()).rejects.toThrow();
+    // Both ids, and no claim about which case it is — BS may reuse
+    // `show_already_open` to refuse the very show we named.
+    await expect(client.join()).rejects.toThrow(/555[\s\S]*777/);
     // Bounded retry: exactly one takeover attempt, never a third call.
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('warns instead of claiming a close when the takeover answers with a co-host membership', async () => {
+    const logger = loggerSpy();
+    const fetchFn = fetchReturning(showAlreadyOpen(555), {
+      status: 200,
+      body: { show_id: 555, dj_id: 'auto-dj-user-id', active: true },
+    });
+
+    await expect(clientWith(fetchFn, logger).join()).resolves.toBe(555);
+
+    expect(logger.info).not.toHaveBeenCalledWith(
+      expect.anything(),
+      'auto-dj took over an abandoned show',
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ showId: 555 }),
+      expect.stringContaining('was not closed'),
+    );
+  });
+
+  it('carries the status and body through when a 409 is not show_already_open', async () => {
+    const fetchFn = fetchReturning({
+      status: 409,
+      body: { message: 'nope', code: 'some_future_code' },
+    });
+    // `allowStatuses` suppressed request()'s own error, so join() is the only
+    // place this gets described — it must not be reported as a missing id alone.
+    await expect(clientWith(fetchFn).join()).rejects.toThrow(/409[\s\S]*some_future_code/);
   });
 
   it('propagates a 400 rejecting the takeover rather than swallowing it', async () => {
