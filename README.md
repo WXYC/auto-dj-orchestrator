@@ -51,6 +51,45 @@ Key sections for the orchestrator:
 | 3.10                   | Virtual switch API (activate/deactivate/status)                           |
 | 5.2                    | `AutoDJ*` type contracts                                                  |
 
+## Provisioning Prerequisites
+
+The orchestrator requires these external resources to be in place before deployment:
+
+### 1. Auto-DJ service account
+
+A Better-Auth user (`auto-dj@wxyc.org` by default) with the `dj` **org-member role** in Backend-Service. This account writes flowsheet entries; its JWT authority is scoped to exactly what a DJ can do — no more.
+
+- **Role:** `dj` (org member). Deliberately NOT `stationManager`, `admin`, or `owner`. The global `user.role` stays `null` — the account cannot act as a Better-Auth admin.
+- **Handle:** `djName: "Auto DJ"` (the on-air name shown on the flowsheet). PII fields are empty — there is no person behind this account.
+- **Provisioning:** Backend-Service self-provisions the account via an idempotent startup bootstrap (`createAutoDjUser()`), gated by **two env vars on the BS side** that both silently no-op when missing or wrong: `CREATE_AUTO_DJ_USER=TRUE` (exact uppercase — `true` or `True` silently skip) and `DEFAULT_ORG_SLUG` (the org must already exist; if missing, the bootstrap warns and returns). Self-signup is disabled (`disableSignUp: true`) and the `/auth/admin/provision-user` endpoint rejects caller-supplied passwords, so the bootstrap is the only viable path.
+- **Password:** `AUTO_DJ_PASSWORD`, stored as a per-environment deploy secret. **Must be distinct between staging and prod.** Never committed to source. **Create-only:** the BS bootstrap is skip-if-exists and does not handle rotation — changing `AUTO_DJ_PASSWORD` on an already-provisioned environment has no effect on the BS side. To rotate, manually reset the password in Backend-Service first.
+
+### 2. Trusted origin
+
+`AUTH_TRUSTED_ORIGIN` (this service's public URL) must be present in Backend-Service's `BETTER_AUTH_TRUSTED_ORIGINS` environment variable. Without it, the `POST /auth/sign-in/email` call is rejected with 403.
+
+### 3. AzuraCast station shortcode
+
+`AZURACAST_STATION_SHORTCODE` must match the live AzuraCast station. The Centrifugo WebSocket channel is `station:<shortcode>`. Verify before deploying to prod:
+
+```bash
+curl https://remote.wxyc.org/api/nowplaying/<shortcode>
+# Must return a single station JSON object whose station.shortcode matches.
+# An array response means the shortcode is wrong (AzuraCast returns 200 either way).
+```
+
+A wrong shortcode silently degrades to HTTP polling only (functional but higher latency; no Centrifugo push). Note: the WXYC station is **named** "wxyc" but its shortcode is `main` — see #33.
+
+### Boot-time preflight
+
+The orchestrator runs a non-fatal preflight check at startup (`src/preflight.ts`) that verifies:
+
+- The AzuraCast shortcode resolves to a real station (not the all-stations fallback)
+
+Auth/account issues are not checked at preflight — TokenManager's first sign-in handles those seconds later with proper retry-after backoff and clear log messages. Preflight targets the one misconfiguration that fails **silently** (wrong shortcode degrades to HTTP polling with no error).
+
+Preflight failures are logged as warnings, not fatal errors, so local dev and CI aren't blocked by missing external services.
+
 ## Tech Stack
 
 - **Runtime**: Node.js 24 / TypeScript (ESM)
@@ -58,7 +97,7 @@ Key sections for the orchestrator:
 - **AzuraCast client**: `centrifuge` (Centrifugo WebSocket) + `fetch` (HTTP polling fallback)
 - **Auth**: Better-Auth JWT service account (sign-in + refresh) for the Backend-Service API; `jose` JWKS validation for the dj-site virtual-switch endpoints; `X-Auto-DJ-Key` for the Arduino channel
 - **Deployment**: Railway (`main` -> staging, `prod` -> production)
-- **Types**: `@wxyc/shared/auto-dj` (vendored locally until published)
+- **Types**: `@wxyc/shared/auto-dj`
 
 See [CLAUDE.md](CLAUDE.md) for the module layout, core design (pure reducer + impure coordinator), and testing.
 
